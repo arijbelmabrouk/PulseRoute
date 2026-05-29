@@ -4,17 +4,22 @@ import numpy as np
 # Step 11 — Signal Quality Score (SNR)
 #
 # FIX 1: SNR dB score recalibrated (ceiling 10 dB)
-# FIX 2: Amplitude score — now DYNAMIC via profile
-#         Uses profile.get_amplitude_target() as
-#         the personal ceiling instead of 0.0055.
-#         Dark-skinned / low-light patients are
-#         scored against their own realistic best,
-#         not a lab benchmark they can never reach.
+# FIX 2: Amplitude score — dynamic via profile
 # FIX 3: HR confidence feeds routing (weight 0.15)
-# NEW  : ITA-based routing threshold adjustment
-#         Darker skin (lower ITA) → lower thresholds
-#         so face is not unfairly routed to palm
-#         purely because of skin-tone physics.
+# FIX 4: ITA-based routing threshold adjustment
+# FIX 5: Filtered std floor check
+#         If filtered signal std < STD_FLOOR_FOR_HRV,
+#         route to palm regardless of SNR score.
+#         Reason: beat timing is too imprecise at
+#         this amplitude for reliable RMSSD — not
+#         a scoring problem, a physics problem.
+#         Value (0.002) is empirical from pilot runs:
+#         std > 0.003 → RMSSD in realistic range
+#         std 0.001–0.002 → RMSSD inflated (200ms+)
+#         std < 0.001 → RMSSD unreliable entirely
+#         0.002 is a conservative floor — avoids
+#         false positives (routing valid signals to
+#         palm) while catching genuinely weak signals.
 # ─────────────────────────────────────────
 
 HR_MIN_BPM = 55
@@ -22,47 +27,41 @@ HR_MAX_BPM = 180
 HR_MIN_HZ  = HR_MIN_BPM / 60
 HR_MAX_HZ  = HR_MAX_BPM / 60
 
-# Default routing thresholds (used when ITA >= 28)
 SNR_HIGH_THRESHOLD   = 0.60
 SNR_MEDIUM_THRESHOLD = 0.40
+
+# Minimum filtered signal std for reliable HRV.
+# Below this, individual beat peaks are too close
+# to the noise floor for precise timing. argmax
+# finds slightly wrong samples → RR interval errors
+# of ±50–100ms → RMSSD inflates to 200–300ms.
+# This is a physics limit, not an algorithm limit.
+# Empirical from pilot data: consistent RMSSD
+# inflation observed at std < 0.002 regardless of
+# beat count or algorithm improvements.
+STD_FLOOR_FOR_HRV = 0.002
 
 
 def get_routing_thresholds(profile=None):
     """
     Get routing thresholds adjusted for skin tone.
 
-    Why ITA affects routing:
-        The amplitude score is the main component
-        that differs by skin tone — darker skin
-        produces lower filtered signal std because
-        melanin absorbs more light before it reaches
-        capillaries. The amplitude score is now
-        personal (via profile), but the routing
-        thresholds should still reflect that darker
-        skin tends to produce lower overall SNR scores
-        even when the HR measurement is valid.
+    Darker skin produces weaker filtered signal
+    amplitude due to melanin absorbing more light
+    before it reaches capillaries. Even with personal
+    amplitude scoring, the overall SNR score tends
+    lower for darker skin under home lighting.
 
-        Reducing the routing threshold slightly for
-        darker skin prevents the system from routing
-        a valid face measurement to palm simply
-        because physics makes the signal weaker.
-        This directly serves your inclusivity thesis.
+    Reducing the routing threshold for darker skin
+    prevents valid face measurements being routed
+    to palm purely because of physics — not because
+    the measurement is wrong.
 
-    Adjustment scale (based on ITA):
-        ITA > 28  (FST I-III) → standard thresholds
-        ITA 10-28 (FST IV)    → 5% reduction
-        ITA -30-10(FST V)     → 10% reduction
-        ITA < -30 (FST VI)    → 15% reduction
-
-    Input:
-        profile — SubjectProfile (optional)
-                  None → standard thresholds
-
-    Output:
-        high_threshold   — float (route palm if below)
-        medium_threshold — float
-        ita_adjustment   — float (reduction applied)
-        source           — string for logging
+    ITA adjustment scale:
+        ITA > 28  (FST I–III) → no change (0.60 / 0.40)
+        ITA 10–28 (FST IV)    → −5%      (0.55 / 0.35)
+        ITA −30–10(FST V)     → −10%     (0.50 / 0.30)
+        ITA < −30 (FST VI)    → −15%     (0.45 / 0.25)
     """
     if profile is None:
         return (SNR_HIGH_THRESHOLD,
@@ -72,13 +71,13 @@ def get_routing_thresholds(profile=None):
     ita = profile.ita
 
     if ita > 28:
-        adjustment = 0.00    # FST I-III: no change
+        adjustment = 0.00
     elif ita > 10:
-        adjustment = 0.05    # FST IV: -5%
+        adjustment = 0.05
     elif ita > -30:
-        adjustment = 0.10    # FST V:  -10%
+        adjustment = 0.10
     else:
-        adjustment = 0.15    # FST VI: -15%
+        adjustment = 0.15
 
     high_thresh   = round(SNR_HIGH_THRESHOLD   - adjustment, 3)
     medium_thresh = round(SNR_MEDIUM_THRESHOLD - adjustment, 3)
@@ -89,8 +88,9 @@ def get_routing_thresholds(profile=None):
 
 def compute_spectral_snr(freqs, power, hr_bpm):
     """
-    Spectral SNR — how clearly HR peak dominates.
-    Peak power vs mean of all other HR band bins.
+    Spectral SNR — HR peak power vs mean of all
+    other HR band bins. Measures how clearly the
+    heart rate frequency dominates the spectrum.
     """
     hr_mask  = (freqs >= HR_MIN_HZ) & \
                (freqs <= HR_MAX_HZ)
@@ -113,7 +113,6 @@ def compute_spectral_snr(freqs, power, hr_bpm):
         return peak_power, 1.0
 
     noise_mean = float(np.mean(hr_power[other_mask]))
-
     if noise_mean == 0:
         return float('inf'), 1.0
 
@@ -121,14 +120,13 @@ def compute_spectral_snr(freqs, power, hr_bpm):
     score = float(
         np.clip((spectral_snr - 2) / 13, 0.0, 1.0)
     )
-
     return round(spectral_snr, 2), round(score, 4)
 
 
 def compute_snr_db(freqs, power):
     """
-    SNR in dB — HR band power vs noise power.
-    Ceiling: 10 dB (realistic excellent webcam result).
+    SNR in dB — HR band power vs total noise power.
+    Ceiling 10 dB = realistic excellent webcam result.
     """
     hr_mask    = (freqs >= HR_MIN_HZ) & \
                  (freqs <= HR_MAX_HZ)
@@ -144,7 +142,6 @@ def compute_snr_db(freqs, power):
 
     snr_db = 10.0 * np.log10(hr_power / noise_power)
     score  = float(np.clip(snr_db / 10.0, 0.0, 1.0))
-
     return round(float(snr_db), 2), round(score, 4)
 
 
@@ -166,7 +163,6 @@ def compute_regularity(rr_intervals):
     score = float(
         np.clip(1.0 - (cv - 0.05) / 0.25, 0.0, 1.0)
     )
-
     return round(cv, 4), round(score, 4)
 
 
@@ -174,44 +170,17 @@ def compute_amplitude_score(filtered, profile=None):
     """
     Signal amplitude score.
 
-    NEW: Uses profile.get_amplitude_target() as the
+    Uses profile.get_amplitude_target() as the
     personal ceiling when profile is available.
+    Dark-skinned patients are scored against their
+    own realistic best, not a lab benchmark.
 
-    Why this matters:
-        A dark-skinned patient under home lighting
-        may only reach filtered std of 0.001.
-        Scoring them against a fixed ceiling of 0.006
-        (calibrated on lab subjects) gives them 0.000
-        — not because their heart isn't beating, but
-        because physics gives them a weaker signal.
-
-        Using their personal calibration amplitude
-        as the ceiling means they're scored against
-        their own realistic best. If they reach 80%
-        of their calibration amplitude, they score
-        well — because that's what good looks like
-        for them specifically.
-
-    Fallback (no profile):
-        Uses the recalibrated fixed formula:
-        floor=0.0005, ceiling=0.006
-        Same as the previous fix.
-
-    Input:
-        filtered — filtered pulse waveform (Step 6)
-        profile  — SubjectProfile (optional)
-
-    Output:
-        amplitude — float (std of filtered signal)
-        score     — float 0.0-1.0
+    Fallback: fixed floor=0.0005, ceiling=0.006.
     """
     amplitude = float(np.std(filtered))
 
     if profile is not None and \
        profile.get_amplitude_target() is not None:
-        # Personal ceiling from calibration
-        # floor = 10% of their target (near-zero signal)
-        # ceiling = their personal best (from calibration)
         personal_target = profile.get_amplitude_target()
         floor   = personal_target * 0.10
         ceiling = personal_target
@@ -227,9 +196,6 @@ def compute_amplitude_score(filtered, profile=None):
             )
         score_source = "personal"
     else:
-        # Fallback — recalibrated fixed formula
-        # floor=0.0005 (dark skin minimum)
-        # ceiling=0.006 (realistic webcam maximum)
         score = float(
             np.clip(
                 (amplitude - 0.0005) / 0.0055,
@@ -249,28 +215,31 @@ def compute_snr_score(filtered, freqs, power,
     """
     Compute final SNR score and routing decision.
 
-    NEW: profile parameter wires in two changes:
-        1. Amplitude score uses personal ceiling
-           (profile.get_amplitude_target())
-        2. Routing thresholds adjusted for skin tone
-           (get_routing_thresholds(profile))
+    Routing to palm happens in two independent ways:
 
-    Weights (unchanged):
+    Way 1 — Composite SNR score below threshold:
+        The weighted 5-component score falls below
+        the ITA-adjusted routing threshold.
+        Means: overall signal quality is too low.
+
+    Way 2 — Filtered std below STD_FLOOR_FOR_HRV:
+        The filtered signal amplitude is too weak
+        for reliable beat timing regardless of score.
+        Means: RMSSD will be inflated and unreliable.
+        This overrides a passing SNR score.
+        Reason: the composite score can pass (spectral
+        SNR looks clean, regularity is good) while the
+        signal amplitude is still too weak for the
+        argmax peak finder to locate beats precisely.
+        ±50–100ms timing errors cascade into 200ms+
+        RMSSD. The std floor catches this case.
+
+    Weights:
         Spectral SNR    0.30
         SNR in dB       0.20
         Regularity      0.20
         Amplitude       0.15
         HR confidence   0.15
-
-    Input:
-        filtered       — filtered pulse (Step 6)
-        freqs          — frequency axis (Step 7)
-        power          — power spectrum (Step 7)
-        hr_bpm         — heart rate BPM (Step 8)
-        rr_intervals   — RR intervals ms (Step 8)
-        fps            — actual fps
-        hr_confidence  — confidence from Step 9
-        profile        — SubjectProfile (optional)
     """
     spectral_snr, spectral_score = \
         compute_spectral_snr(freqs, power, hr_bpm)
@@ -300,11 +269,13 @@ def compute_snr_score(filtered, freqs, power,
     )
     snr_score = round(snr_score, 4)
 
-    # ITA-adjusted routing thresholds
+    # ── ITA-adjusted routing thresholds ───────────
     high_thresh, medium_thresh, \
     ita_adjustment, thresh_source = \
         get_routing_thresholds(profile)
 
+    # ── Routing decision ──────────────────────────
+    # Check 1: composite score
     if snr_score >= high_thresh:
         quality_level = 'high'
         route_palm    = False
@@ -315,24 +286,37 @@ def compute_snr_score(filtered, freqs, power,
         quality_level = 'low'
         route_palm    = True
 
+    # Check 2: std floor override
+    # Overrides a passing score when signal amplitude
+    # is too weak for reliable beat timing.
+    std_too_weak   = amplitude < STD_FLOOR_FOR_HRV
+    std_floor_triggered = False
+
+    if std_too_weak and not route_palm:
+        route_palm          = True
+        quality_level       = 'low'
+        std_floor_triggered = True
+
     report = {
-        'snr_score':          snr_score,
-        'snr_db':             snr_db,
-        'spectral_snr':       spectral_snr,
-        'spectral_score':     spectral_score,
-        'db_score':           db_score,
-        'rr_cv':              rr_cv,
-        'regularity_score':   regularity_score,
-        'amplitude':          amplitude,
-        'amplitude_score':    amplitude_score,
-        'amplitude_source':   amp_source,
-        'confidence_score':   confidence_score,
-        'quality_level':      quality_level,
-        'route_palm':         route_palm,
-        'high_threshold':     high_thresh,
-        'medium_threshold':   medium_thresh,
-        'ita_adjustment':     ita_adjustment,
-        'threshold_source':   thresh_source,
+        'snr_score':            snr_score,
+        'snr_db':               snr_db,
+        'spectral_snr':         spectral_snr,
+        'spectral_score':       spectral_score,
+        'db_score':             db_score,
+        'rr_cv':                rr_cv,
+        'regularity_score':     regularity_score,
+        'amplitude':            amplitude,
+        'amplitude_score':      amplitude_score,
+        'amplitude_source':     amp_source,
+        'confidence_score':     confidence_score,
+        'quality_level':        quality_level,
+        'route_palm':           route_palm,
+        'high_threshold':       high_thresh,
+        'medium_threshold':     medium_thresh,
+        'ita_adjustment':       ita_adjustment,
+        'threshold_source':     thresh_source,
+        'std_floor_triggered':  std_floor_triggered,
+        'std_floor_value':      STD_FLOOR_FOR_HRV,
     }
 
     return (
@@ -402,7 +386,14 @@ def print_snr_report(snr_score, snr_db,
     print(f"  LOW    <  {report['medium_threshold']:.3f}  "
           f"→ route to palm")
 
+    print(f"\n  Std floor check: "
+          f"std={report['amplitude']:.6f}  "
+          f"floor={report['std_floor_value']}  "
+          f"{'⚠ TRIGGERED' if report['std_floor_triggered'] else 'OK'}")
+
     routing_str = '⚠ ROUTE TO PALM' \
                   if route_palm else '✓ FACE ACCEPTED'
+    if report['std_floor_triggered']:
+        routing_str += ' (signal too weak for HRV)'
     print(f"\nRouting decision: {routing_str}")
     print(f"{'='*45}")

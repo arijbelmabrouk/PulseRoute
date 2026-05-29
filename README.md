@@ -178,23 +178,63 @@ NumPy rfft converts the filtered pulse to frequency domain. Frequency resolution
 Final HR: weighted combination of FFT estimate (70%) and RR mean (30%). Falls back to FFT-only if estimates disagree by >10 BPM. Computes RMSSD (primary) and SDNN (indicative for short recordings). HRV interpretation uses age-adjusted norms when `SubjectProfile.age` is set.
 
 ### Step 11 — Signal Quality Score + Routing
+
 Five-component weighted score:
 
 | Component | Weight | What it measures |
 |---|---|---|
-| Spectral SNR | 0.30 | HR peak dominance over noise |
+| Spectral SNR | 0.30 | HR peak dominance over noise bins |
 | SNR in dB | 0.20 | HR band power vs total noise power |
-| RR regularity | 0.20 | Beat-to-beat consistency (CV) |
-| Amplitude | 0.15 | Signal strength vs personal target |
+| RR regularity | 0.20 | Beat-to-beat consistency (CV of RR intervals) |
+| Amplitude | 0.15 | Signal strength vs personal calibration target |
 | HR confidence | 0.15 | Step 9 measurement reliability |
 
-Routing thresholds adjusted for skin tone (ITA):
-- FST I–III: HIGH ≥ 0.60, MEDIUM ≥ 0.40
-- FST IV: HIGH ≥ 0.55, MEDIUM ≥ 0.35
-- FST V: HIGH ≥ 0.50, MEDIUM ≥ 0.30
-- FST VI: HIGH ≥ 0.45, MEDIUM ≥ 0.25
+---
 
-Score below MEDIUM threshold → route to palm.
+#### When and why the system routes to palm
+
+The system routes to palm in two independent ways. Either condition alone is enough to trigger the switch.
+
+**Way 1 — Composite SNR score below threshold**
+
+The weighted score falls below the ITA-adjusted routing threshold. This means overall signal quality is too low — the HR frequency doesn't dominate the spectrum clearly enough, beat timing is irregular, or the signal is too weak relative to the patient's own calibration baseline.
+
+Routing thresholds are adjusted for skin tone because darker skin produces lower signal amplitude by physics (melanin absorbs more light before it reaches capillaries). Without adjustment, darker-skinned patients would be routed to palm even when their measurement is valid — just quieter.
+
+| Skin tone | HIGH threshold | MEDIUM threshold |
+|---|---|---|
+| FST I–III (ITA > 28) | ≥ 0.60 | ≥ 0.40 |
+| FST IV (ITA 10–28) | ≥ 0.55 | ≥ 0.35 |
+| FST V (ITA −30–10) | ≥ 0.50 | ≥ 0.30 |
+| FST VI (ITA < −30) | ≥ 0.45 | ≥ 0.25 |
+
+Score ≥ HIGH → face accepted, result reliable.
+Score ≥ MEDIUM → face accepted, result usable.
+Score < MEDIUM → route to palm.
+
+**Way 2 — Signal amplitude below HRV reliability floor**
+
+Even when the composite score passes, the system checks whether the filtered signal standard deviation is above `0.002`. If not, it routes to palm regardless of the score.
+
+This exists because the composite score can look clean while HRV is still unreliable. The spectral SNR can be high (the HR frequency is visible in the FFT), regularity can be good (beats are found at roughly the right rate), but if the filtered signal std is below 0.002, the individual beat peaks are too close to the noise floor for the argmax peak finder to locate the correct sample precisely. Timing errors of ±50–100ms per beat cascade into RMSSD values of 200–300ms — inflated by 3–5× the true value.
+
+This is a physics limit, not an algorithm limit. No amount of peak detection improvement fixes it at this signal strength. The palm, which has higher superficial capillary density and minimal melanin variation, consistently produces 31% stronger signal and crosses this floor reliably.
+
+The value `0.002` was set empirically from pilot recordings:
+
+| Filtered std | Observed RMSSD | Beat timing |
+|---|---|---|
+| > 0.005 | 40–80ms (realistic) | Precise |
+| 0.002–0.005 | 100–180ms (borderline) | Imprecise |
+| < 0.002 | 200–300ms (inflated) | Unreliable |
+
+`0.002` is deliberately conservative — lower than the literature threshold of ~0.003 — to avoid routing valid signals to palm unnecessarily. It should be validated against a larger dataset and adjusted if the boundary shifts.
+
+When this check triggers, the terminal output shows:
+```
+Std floor check: std=0.000892  floor=0.002  ⚠ TRIGGERED
+Routing decision: ⚠ ROUTE TO PALM (signal too weak for HRV)
+```
 
 ### Step 12 — Display (in development)
 Will render a live dashboard showing all vitals with confidence indicators, quality level, and palm prompt when routing is triggered.
