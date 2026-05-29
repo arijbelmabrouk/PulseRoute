@@ -75,16 +75,6 @@ from step11_signal_quality_score.step11_snr import (
     print_snr_report
 )
 
-# Step 12 — uncommented when built
-# from step12_display.step12_display import display_results
-
-# Palm routing — added after Step 12 complete
-# from step3_signal_extraction.step3_palm_signal import (
-#     PalmROIState,
-#     run_palm_roi_extraction,
-#     run_palm_signal_extraction
-# )
-
 
 # ─────────────────────────────────────────
 # Adaptive cutoff helper
@@ -93,30 +83,17 @@ from step11_signal_quality_score.step11_snr import (
 def get_adaptive_low_hz(rr_valid, rr_hz,
                          rr_confidence):
     """
-    Compute adaptive bandpass lower cutoff
-    based on detected respiratory frequency.
-
-    Sets cutoff just above breathing frequency
-    with 0.1 Hz buffer — replaces fixed 55 BPM.
-
-    If respiratory rate not reliably detected:
-    falls back to 0.917 Hz (55 BPM).
-
-    Input:
-        rr_valid      — bool from Step 10
-        rr_hz         — breathing frequency Hz
-        rr_confidence — confidence 0.0-1.0
-
-    Output:
-        adaptive_low_hz — lower cutoff in Hz
+    Compute adaptive bandpass lower cutoff based on
+    detected respiratory frequency.
+    Falls back to 0.917 Hz (55 BPM) if unreliable.
     """
     if rr_valid and rr_hz is not None \
        and rr_confidence > 0.4:
         low_hz = rr_hz + 0.10
-        low_hz = max(low_hz, 0.667)  # min 40 BPM
+        low_hz = max(low_hz, 0.667)
         return round(low_hz, 4)
     else:
-        return 0.917  # fallback 55 BPM
+        return 0.917
 
 
 # ─────────────────────────────────────────
@@ -136,14 +113,20 @@ if __name__ == "__main__":
         print("Camera failed")
         sys.exit(1)
 
-    # ── Step 2 — Face ROI ─────────────────────────
+    # ── Step 2 — Face ROI + Calibration ───────────
+    # CHANGED: duration_sec=10 (was 5)
+    #   Phase 1 (0-5s):  BiSeNet mask setup
+    #   Phase 2 (5-10s): Calibration sampling
+    #                    → builds SubjectProfile
+    # CHANGED: now captures returned profile
     print("\n" + "="*50)
-    print("STEP 2 — Face ROI extraction (BiSeNet)")
+    print("STEP 2 — Face ROI extraction + Calibration")
     print("="*50)
 
     face_state = FaceROIState()
-    run_face_roi_extraction(
-        cap, actual_fps, face_state, duration_sec=5
+    profile = run_face_roi_extraction(      # ← captures profile
+        cap, actual_fps, face_state,
+        duration_sec=10                     # ← was 5
     )
 
     if face_state.combined_mask is None:
@@ -152,13 +135,18 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # ── Step 3 ────────────────────────────────────
+    # CHANGED: profile=profile passed in
+    #   Motion rejection now active using personal
+    #   threshold from SubjectProfile.
     print("\n" + "="*50)
     print("STEP 3 — RGB signal extraction (face)")
     print("="*50)
 
     r, g, b, fps_measured, quality_ok, issues, _ = \
         run_face_signal_extraction(
-            cap, actual_fps, face_state
+            cap, actual_fps, face_state,
+            duration_sec=35,
+            profile=profile                 # ← NEW
         )
 
     if not quality_ok:
@@ -231,12 +219,13 @@ if __name__ == "__main__":
     print("STEP 6 — Bandpass filter (adaptive)")
     print("="*50)
 
-    filtered = apply_bandpass_filter(
+    filtered, clip_report = apply_bandpass_filter(
         pulse, fps_measured,
-        low_hz=adaptive_low_hz
+        low_hz=adaptive_low_hz,
+        profile=profile
     )
 
-    print_filter_report(pulse, filtered, fps_measured)
+    print_filter_report(pulse, filtered, fps_measured, clip_report)
 
     # ── Step 7 ────────────────────────────────────
     print("\n" + "="*50)
@@ -253,7 +242,7 @@ if __name__ == "__main__":
         fps_measured
     )
 
-    # ── Step 8 ────────────────────────────────────
+    # ── Step 8 ────────────────────────────────────────────
     print("\n" + "="*50)
     print("STEP 8 — Peak detection")
     print("="*50)
@@ -262,35 +251,38 @@ if __name__ == "__main__":
     n_peaks, n_harmonics = \
         find_dominant_peak(freqs, power)
 
-    peak_indices, peak_times, rr_intervals = \
+    # First pass — signal_quality unknown yet
+    peak_indices, peak_times, rr_intervals, rr_tolerance = \
         detect_beat_peaks(
             filtered, fps_measured,
-            hr_bpm_fft=hr_bpm
+            hr_bpm_fft=hr_bpm,
+            profile=profile,
+            signal_quality=None
         )
 
     peak_quality_ok, peak_report = print_peak_report(
         hr_bpm, peak_hz, peak_power,
         rr_intervals, peak_times,
-        n_peaks, n_harmonics
+        n_peaks, n_harmonics,
+        rr_tolerance=rr_tolerance
     )
 
-    # ── Step 9 ────────────────────────────────────
+    # ── Step 9 — first pass (feeds confidence to Step 11) ─
     print("\n" + "="*50)
     print("STEP 9 — Heart rate & HRV")
     print("="*50)
 
-    hr_results = compute_hr_hrv(
+    hr_results_pass1 = compute_hr_hrv(
         hr_bpm_fft   = hr_bpm,
         rr_intervals = rr_intervals,
         peak_times   = peak_times,
         snr_ratio    = fft_report.get('snr_ratio', 0),
         quality_ok   = quality_ok,
-        fps          = fps_measured
+        fps          = fps_measured,
+        profile      = profile
     )
 
-    print_hr_hrv_report(hr_results)
-
-    # ── Step 11 — SNR score ───────────────────────
+    # ── Step 11 ───────────────────────────────────────────
     print("\n" + "="*50)
     print("STEP 11 — Signal quality score")
     print("="*50)
@@ -299,7 +291,9 @@ if __name__ == "__main__":
     quality_level, snr_report = \
         compute_snr_score(
             filtered, freqs, power,
-            hr_bpm, rr_intervals, fps_measured
+            hr_bpm, rr_intervals, fps_measured,
+            hr_confidence=hr_results_pass1['confidence'],
+            profile=profile
         )
 
     print_snr_report(
@@ -307,15 +301,32 @@ if __name__ == "__main__":
         route_palm, quality_level, snr_report
     )
 
-    # ── Routing — added after Step 12 complete ────
-    # if route_palm:
-    #     run_palm_pipeline(cap, actual_fps)
+    # ── Step 8 — second pass (signal_quality now known) ───
+    # Re-filter RR intervals with quality-driven tolerance.
+    # Does NOT re-run peak detection — only re-filters.
+    print(f"\nStep 8 second pass — "
+        f"refining RR filter with quality={snr_score:.3f}")
 
-    # ── Step 12 — added next ──────────────────────
-    # display_results(
-    #     hr_results, rr_bpm, snr_score,
-    #     face_state.ita, "face"
-    # )
+    _, _, rr_intervals, rr_tolerance = \
+        detect_beat_peaks(
+            filtered, fps_measured,
+            hr_bpm_fft=hr_bpm,
+            profile=profile,
+            signal_quality=snr_score    # real quality now
+        )
+
+    # ── Step 9 — final pass (refined RR intervals) ────────
+    hr_results = compute_hr_hrv(
+        hr_bpm_fft   = hr_bpm,
+        rr_intervals = rr_intervals,
+        peak_times   = peak_times,
+        snr_ratio    = fft_report.get('snr_ratio', 0),
+        quality_ok   = quality_ok,
+        fps          = fps_measured,
+        profile      = profile
+    )
+
+    print_hr_hrv_report(hr_results)
 
     # ── Final summary ─────────────────────────────
     print(f"\n{'='*50}")
@@ -332,7 +343,11 @@ if __name__ == "__main__":
     print(f"Confidence:    "
           f"{hr_results['confidence']} "
           f"({hr_results['confidence_level'].upper()})")
-    print(f"ITA:           {face_state.ita:.1f}")
+    print(f"ITA:           {face_state.ita:.1f}  "
+          f"({profile.fitzpatrick})")
+    print(f"Profile valid: {profile.is_valid}")
+    if profile.hr_estimate_bpm:
+        print(f"Calib HR est:  {profile.hr_estimate_bpm} BPM")
     print(f"\nReady for Step 12 (display)")
 
     cap.release()

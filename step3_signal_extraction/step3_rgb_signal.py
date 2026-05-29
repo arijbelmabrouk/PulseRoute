@@ -10,7 +10,7 @@ from collections import deque
 #
 # Purpose: Convert each video frame into three
 # numbers (mean R, G, B) from the ROI pixels.
-# Accumulate over 30 seconds to build the raw
+# Accumulate over N seconds to build the raw
 # pulse waveform for POS algorithm in Step 5.
 #
 # AI contribution: ITA-adaptive quality filter
@@ -18,15 +18,33 @@ from collections import deque
 # based on skin tone — improves SNR for FST V-VI
 # without degrading FST I-II performance.
 #
+# NEW — Motion rejection (MotionDetector):
+#   Frames where the green channel deviates more
+#   than the patient's personal threshold from
+#   the rolling mean are silently skipped.
+#   The buffer waits for a clean frame.
+#   Handles coughing, talking, swallowing, and
+#   sudden movements without corrupting the signal.
+#   The patient does not need to know — the timer
+#   simply extends until enough clean frames arrive.
+#
 # No neural network — pure NumPy mathematics
-# informed by skin tone from Step 2.
+# informed by skin tone and SubjectProfile.
 # ─────────────────────────────────────────
 
-# Signal buffer duration in seconds
+# Default signal buffer duration in seconds
 SIGNAL_DURATION_SEC = 30
 
 # Minimum pixels required for valid extraction
 MIN_ROI_PIXELS = 50
+
+# Rolling window for motion baseline (frames)
+MOTION_WINDOW_SIZE = 10
+
+# Max recording time multiplier — prevents infinite
+# loop if patient moves constantly
+# E.g. duration_sec=35 → max wall time = 35 × 2.5 = 87.5s
+MAX_DURATION_MULTIPLIER = 2.5
 
 
 # ─────────────────────────────────────────
@@ -46,57 +64,123 @@ def compute_adaptive_thresholds(ita_angle):
         misclassify dark skin pixels as underexposed
         and overexposed at different absolute values.
 
-    Threshold adaptation logic:
-
-        Overexposure threshold:
-            Light skin (high ITA) → 240 (standard)
-            Dark skin  (low ITA)  → 200 (tighter)
-            Why: specular reflection on dark skin
-            corrupts signal at lower absolute values
-            than on light skin. A value of 220 on
-            dark skin may represent saturation while
-            on light skin it is normal.
-
-        Underexposure threshold:
-            Light skin (high ITA) → 30 (standard)
-            Dark skin  (low ITA)  → 50 (higher)
-            Why: dark skin pixels have lower baseline
-            values — a pixel at value 35 on dark skin
-            may be well-lit while on light skin it
-            indicates shadow. Raising the threshold
-            filters more aggressively for dark skin
-            to remove shadow-contaminated pixels.
-
     ITA scale:
         >  55 → FST I-II   (Very Light)
         28–55 → FST III    (Light-Medium)
         10–28 → FST IV     (Medium)
        -30–10 → FST V      (Medium-Dark)
         < -30 → FST VI     (Dark)
-
-    Input:
-        ita_angle — float, ITA value from Step 2
-
-    Output:
-        overexposure_threshold  — int (180-240)
-        underexposure_threshold — int (30-60)
     """
-    # Normalize ITA to 0-1 range
-    # Clamp to expected range [-60, 90]
     ita_clamped    = max(-60.0, min(90.0, float(ita_angle)))
-    ita_normalized = (ita_clamped + 60.0) / 150.0  # 0=dark, 1=light
+    ita_normalized = (ita_clamped + 60.0) / 150.0
 
-    # Overexposure threshold — tighter for dark skin
-    # Light skin: 240 (standard)
-    # Dark skin:  200 (tighter — catches specular earlier)
-    overexposure_threshold = int(200 + ita_normalized * 40)
-
-    # Underexposure threshold — higher for dark skin
-    # Light skin: 30 (standard)
-    # Dark skin:  60 (higher — filters shadow pixels)
+    overexposure_threshold  = int(200 + ita_normalized * 40)
     underexposure_threshold = int(60 - ita_normalized * 30)
 
     return overexposure_threshold, underexposure_threshold
+
+
+# ─────────────────────────────────────────
+# Motion Detector
+# ─────────────────────────────────────────
+
+class MotionDetector:
+    """
+    Per-frame motion artifact detector.
+
+    Uses the patient's personal motion threshold
+    from SubjectProfile (3× their own baseline
+    green channel noise floor).
+
+    Logic:
+        Maintain a rolling window of the last
+        MOTION_WINDOW_SIZE clean green channel values.
+        For each new frame, compare its green mean
+        to the rolling mean.
+        If |delta| > threshold → motion artifact → skip.
+        If |delta| <= threshold → clean frame → accept.
+
+    This is personal because:
+        - A fidgety patient's rolling std is higher
+          so their threshold is higher — fair.
+        - A still patient's threshold is tighter
+          so genuine artifacts are caught — accurate.
+        - If no profile provided, a conservative
+          fixed threshold is used as fallback.
+
+    Attributes:
+        threshold     — motion rejection threshold
+        window        — deque of recent clean G values
+        rejected      — count of rejected frames
+        accepted      — count of accepted frames
+    """
+
+    def __init__(self, profile=None):
+        """
+        Input:
+            profile — SubjectProfile (optional).
+                      If None, uses conservative default.
+        """
+        if profile is not None and \
+           profile.motion_threshold is not None:
+            self.threshold = profile.motion_threshold
+            self._source   = "personal"
+        else:
+            # Conservative fallback — no profile
+            # 6.0 is 3× a typical std of 2.0
+            self.threshold = 6.0
+            self._source   = "default"
+
+        self.window   = deque(maxlen=MOTION_WINDOW_SIZE)
+        self.rejected = 0
+        self.accepted = 0
+
+    def is_clean(self, mean_g):
+        """
+        Decide if this frame is clean or a motion artifact.
+
+        If window has fewer than 3 frames, always accept
+        — need baseline before rejection starts.
+
+        Input:
+            mean_g — green channel mean for this frame
+
+        Output:
+            True  — frame is clean, add to buffer
+            False — motion artifact, skip this frame
+        """
+        if len(self.window) < 3:
+            self.window.append(mean_g)
+            self.accepted += 1
+            return True
+
+        rolling_mean = float(np.mean(self.window))
+        delta        = abs(mean_g - rolling_mean)
+
+        if delta > self.threshold:
+            self.rejected += 1
+            return False
+
+        # Clean frame — update rolling window
+        self.window.append(mean_g)
+        self.accepted += 1
+        return True
+
+    def get_rejection_rate(self):
+        """Fraction of frames rejected (0.0–1.0)."""
+        total = self.rejected + self.accepted
+        if total == 0:
+            return 0.0
+        return round(self.rejected / total, 3)
+
+    def print_summary(self):
+        """Print motion rejection statistics."""
+        rate = self.get_rejection_rate()
+        print(f"  Motion detector:  "
+              f"threshold={self.threshold:.4f} "
+              f"({self._source})  "
+              f"rejected={self.rejected}  "
+              f"rate={rate:.1%}")
 
 
 # ─────────────────────────────────────────
@@ -107,60 +191,18 @@ def extract_rgb_signal(frame_rgb, mask, ita_angle=55.0):
     """
     Extract mean R, G, B from ROI pixels with
     ITA-adaptive quality filtering.
-
-    Two-stage process:
-        1. Adaptive quality filter — removes pixels
-           that corrupt the rPPG signal, with
-           thresholds adjusted for subject skin tone
-        2. Spatial averaging — collapses remaining
-           pixels to three scalar mean values
-
-    Quality filter removes:
-        Overexposed pixels  — saturated, cannot
-            reflect blood flow color changes.
-            Threshold adapted to skin tone.
-        Underexposed pixels — too dark, dominated
-            by noise not blood flow.
-            Threshold adapted to skin tone.
-
-    Fallback to unfiltered mean if fewer than 30%
-    of pixels pass the filter — prevents signal
-    dropout in poor lighting conditions.
-
-    Input:
-        frame_rgb  — RGB frame (H, W, 3) uint8
-        mask       — binary ROI mask (H, W)
-                     1 = inside ROI, 0 = outside
-        ita_angle  — ITA skin tone value from Step 2
-                     default 55.0 = light skin
-                     (safe fallback if not available)
-
-    Output:
-        mean_r            — mean red   channel (float)
-        mean_g            — mean green channel (float)
-        mean_b            — mean blue  channel (float)
-        pixel_count       — number of pixels used
-        quality_ratio     — fraction of pixels kept
-        thresholds_used   — (over, under) tuple
-                            for logging and validation
     """
-    # Extract ROI pixels via boolean indexing
-    # roi_pixels shape: (N, 3)
     roi_pixels = frame_rgb[mask == 1]
 
     if len(roi_pixels) < MIN_ROI_PIXELS:
         return 0.0, 0.0, 0.0, 0, 0.0, (240, 30)
 
-    # ── Adaptive thresholds from skin tone ────────
     over_thresh, under_thresh = \
         compute_adaptive_thresholds(ita_angle)
 
-    # ── Quality filter ────────────────────────────
-    # Overexposed: any channel at or above threshold
     not_overexposed  = np.all(
         roi_pixels < over_thresh, axis=1
     )
-    # Underexposed: all channels below threshold
     not_underexposed = np.any(
         roi_pixels > under_thresh, axis=1
     )
@@ -169,7 +211,6 @@ def extract_rgb_signal(frame_rgb, mask, ita_angle=55.0):
     quality_ratio  = float(quality_filter.sum()) / \
                      len(roi_pixels)
 
-    # Apply filter if enough pixels remain
     min_threshold = max(
         MIN_ROI_PIXELS,
         int(len(roi_pixels) * 0.3)
@@ -178,11 +219,9 @@ def extract_rgb_signal(frame_rgb, mask, ita_angle=55.0):
     if quality_filter.sum() >= min_threshold:
         pixels_to_use = roi_pixels[quality_filter]
     else:
-        # Fallback — use all pixels
         pixels_to_use = roi_pixels
         quality_ratio = 0.0
 
-    # ── Spatial averaging ─────────────────────────
     means  = np.mean(pixels_to_use, axis=0)
     mean_r = float(means[0])
     mean_g = float(means[1])
@@ -205,39 +244,23 @@ def extract_rgb_signal(frame_rgb, mask, ita_angle=55.0):
 class RGBSignalBuffer:
     """
     Accumulates per-frame RGB mean values over time.
-
-    Stores three signal arrays plus metadata:
-        timestamps     — for accurate FFT frequency bins
-        pixel_counts   — pixels used per frame
-        quality_ratios — filter quality per frame
-        ita_values     — skin tone per frame
-                         (tracks lighting-induced drift)
-        thresholds     — adaptive thresholds used
-                         (for validation logging)
-
-    At 30fps × 30s = 900 values per channel.
-    Adapts to any fps from Step 1 measurement.
+    Only clean frames (passed motion detector) are added.
     """
 
     def __init__(self, actual_fps,
                  duration_sec=SIGNAL_DURATION_SEC):
-        """
-        Input:
-            actual_fps   — measured fps from Step 1
-            duration_sec — recording window in seconds
-        """
         self.actual_fps   = actual_fps
         self.duration_sec = duration_sec
         self.buffer_size  = int(actual_fps * duration_sec)
 
-        self.r_signal      = []
-        self.g_signal      = []
-        self.b_signal      = []
-        self.timestamps    = []
-        self.pixel_counts  = []
+        self.r_signal       = []
+        self.g_signal       = []
+        self.b_signal       = []
+        self.timestamps     = []
+        self.pixel_counts   = []
         self.quality_ratios = []
-        self.ita_values    = []
-        self.thresholds    = []
+        self.ita_values     = []
+        self.thresholds     = []
 
         print(f"Signal buffer: {self.buffer_size} frames "
               f"({duration_sec}s @ {actual_fps:.1f}fps)")
@@ -245,16 +268,6 @@ class RGBSignalBuffer:
     def add_frame(self, mean_r, mean_g, mean_b,
                   pixel_count, quality_ratio,
                   ita_angle=55.0, thresholds=(240, 30)):
-        """
-        Add one frame to the buffer.
-
-        Input:
-            mean_r, mean_g, mean_b — channel means
-            pixel_count            — pixels used
-            quality_ratio          — filter ratio
-            ita_angle              — skin tone this frame
-            thresholds             — (over, under) used
-        """
         if len(self.r_signal) >= self.buffer_size:
             return
 
@@ -267,25 +280,10 @@ class RGBSignalBuffer:
         self.ita_values.append(ita_angle)
         self.thresholds.append(thresholds)
 
-    def is_ready(self):
-        """True when 10+ seconds collected — FFT minimum."""
-        return len(self.r_signal) >= \
-               int(self.actual_fps * 10)
-
     def is_full(self):
-        """True when full 30 seconds collected."""
         return len(self.r_signal) >= self.buffer_size
 
     def get_signals(self):
-        """
-        Return collected signals as NumPy arrays.
-        Feeds directly into Step 4 (normalization)
-        and Step 5 (POS algorithm).
-
-        Output:
-            r, g, b — channel arrays (N,)
-            t       — timestamp array (N,)
-        """
         return (
             np.array(self.r_signal),
             np.array(self.g_signal),
@@ -294,11 +292,6 @@ class RGBSignalBuffer:
         )
 
     def get_actual_fps(self):
-        """
-        Calculate real fps from timestamps.
-        More accurate than Step 1 initial measurement.
-        Used for FFT frequency bin calculation in Step 7.
-        """
         if len(self.timestamps) < 2:
             return self.actual_fps
         total_time = self.timestamps[-1] - \
@@ -308,35 +301,22 @@ class RGBSignalBuffer:
         return (len(self.timestamps) - 1) / total_time
 
     def get_progress(self):
-        """Recording progress as fraction and seconds."""
         n        = len(self.r_signal)
         progress = n / self.buffer_size
         elapsed  = n / self.actual_fps
         return round(progress, 3), round(elapsed, 1)
 
     def get_mean_quality(self):
-        """Mean quality ratio across all frames."""
         if len(self.quality_ratios) == 0:
             return 0.0
         return round(float(np.mean(self.quality_ratios)), 3)
 
     def get_mean_ita(self):
-        """
-        Mean ITA across recording session.
-        Used for per-subject skin tone logging
-        and Fitzpatrick group assignment in results.
-        """
         if len(self.ita_values) == 0:
             return 0.0
         return round(float(np.mean(self.ita_values)), 1)
 
     def get_threshold_summary(self):
-        """
-        Summary of adaptive thresholds used.
-        For validation — shows how much thresholds
-        varied across the recording session.
-        Useful for your research methodology section.
-        """
         if len(self.thresholds) == 0:
             return {}
         over_vals  = [t[0] for t in self.thresholds]
@@ -350,7 +330,6 @@ class RGBSignalBuffer:
         }
 
     def reset(self):
-        """Clear all buffers — start fresh recording."""
         self.r_signal       = []
         self.g_signal       = []
         self.b_signal       = []
@@ -359,7 +338,6 @@ class RGBSignalBuffer:
         self.quality_ratios = []
         self.ita_values     = []
         self.thresholds     = []
-        print("Signal buffer reset")
 
 
 # ─────────────────────────────────────────
@@ -367,36 +345,12 @@ class RGBSignalBuffer:
 # ─────────────────────────────────────────
 
 def assess_signal_quality(buffer):
-    """
-    Assess collected RGB signal quality before
-    passing to POS algorithm.
-
-    Four checks:
-        1. Enough frames (minimum 10 seconds)
-        2. Mean pixel quality ratio > 0.5
-        3. Green channel has detectable variance
-           (flat = no pulse detected)
-        4. Signal not clipping at 0 or 255
-
-    Also returns SNR estimate and adaptive
-    threshold summary for validation logging.
-
-    Input:
-        buffer — RGBSignalBuffer instance
-
-    Output:
-        quality_ok         — bool
-        issues             — list of problem strings
-        snr_estimate       — rough SNR from green variance
-        threshold_summary  — adaptive threshold stats
-    """
     issues = []
     r, g, b, t = buffer.get_signals()
 
     if len(g) == 0:
         return False, ["No signal collected"], 0.0, {}
 
-    # Check 1 — enough data
     min_frames = int(buffer.actual_fps * 10)
     if len(g) < min_frames:
         issues.append(
@@ -404,14 +358,12 @@ def assess_signal_quality(buffer):
             f"(need {min_frames})"
         )
 
-    # Check 2 — pixel quality
     mean_quality = buffer.get_mean_quality()
     if mean_quality < 0.5:
         issues.append(
             f"Low pixel quality: {mean_quality:.2f}"
         )
 
-    # Check 3 — green channel variance
     g_std = float(np.std(g))
     if g_std < 0.05:
         issues.append(
@@ -419,17 +371,14 @@ def assess_signal_quality(buffer):
             f"(no pulse detected)"
         )
 
-    # Check 4 — clipping
     g_mean = float(np.mean(g))
     if g_mean > 250 or g_mean < 5:
         issues.append(
             f"Signal clipping: mean_g={g_mean:.1f}"
         )
 
-    # SNR estimate from green variance
-    snr_estimate = (g_std / g_mean * 100) \
-                   if g_mean > 0 else 0.0
-
+    snr_estimate      = (g_std / g_mean * 100) \
+                        if g_mean > 0 else 0.0
     threshold_summary = buffer.get_threshold_summary()
     quality_ok        = len(issues) == 0
 
@@ -448,43 +397,75 @@ def assess_signal_quality(buffer):
 def run_signal_extraction(cap, actual_fps,
                           get_mask_fn,
                           get_ita_fn=None,
-                          modality="face"):
+                          modality="face",
+                          duration_sec=30,
+                          profile=None):
     """
-    Run RGB signal extraction for 30 seconds.
+    Run RGB signal extraction for duration_sec seconds.
 
-    Receives camera from Step 1 and mask function
-    from Step 2. Works identically for face or palm.
+    NEW: Accepts optional SubjectProfile.
+    When profile is provided, motion rejection is active:
+        - Frames where green channel deviates by more
+          than profile.motion_threshold from the rolling
+          mean are silently skipped.
+        - The buffer waits for a clean frame.
+        - The recording extends automatically if
+          the patient moves a lot (up to
+          MAX_DURATION_MULTIPLIER × duration_sec).
+        - The patient-facing timer shows clean frame
+          count, not wall time — honest progress.
 
-    ITA angle updated each frame via get_ita_fn
-    so adaptive thresholds track any drift in
-    lighting conditions during the session.
+    This makes the pipeline robust to coughing, talking,
+    swallowing, and sudden movements without requiring
+    the patient to stay perfectly still.
 
     Input:
-        cap        — VideoCapture from Step 1
-        actual_fps — measured fps from Step 1
-        get_mask_fn — callable returning
-                      (combined_mask, fore_mask,
-                       cheek_mask) per frame
-        get_ita_fn  — callable returning current
-                      ITA float (optional —
-                      defaults to 55.0 if None)
-        modality   — 'face' or 'palm' for display
+        cap          — VideoCapture from Step 1
+        actual_fps   — measured fps from Step 1
+        get_mask_fn  — callable returning
+                       (combined, forehead, cheek) masks
+        get_ita_fn   — callable returning ITA float
+        modality     — 'face' or 'palm' for display
+        duration_sec — target clean recording seconds
+        profile      — SubjectProfile (optional)
+                       None → no motion rejection
 
     Output:
-        r, g, b       — NumPy signal arrays
-        fps_measured  — actual fps during recording
-        quality_ok    — bool
-        issues        — list of issue strings
+        r, g, b        — NumPy signal arrays (clean frames only)
+        fps_measured   — actual fps during recording
+        quality_ok     — bool
+        issues         — list of issue strings
         thresh_summary — adaptive threshold stats
     """
-    buffer  = RGBSignalBuffer(actual_fps)
-    current_ita = 55.0  # default light skin fallback
+    buffer   = RGBSignalBuffer(actual_fps,
+                               duration_sec=duration_sec)
+    detector = MotionDetector(profile=profile)
+
+    # Wall-clock deadline — prevents infinite recording
+    # if patient moves constantly
+    max_wall_time = duration_sec * MAX_DURATION_MULTIPLIER
+    wall_deadline = time.time() + max_wall_time
+
+    current_ita = 55.0
+    motion_on   = profile is not None
 
     print(f"\nStarting {modality} signal extraction...")
-    print(f"Recording {SIGNAL_DURATION_SEC} seconds")
+    print(f"Target: {duration_sec}s of clean signal")
+    if motion_on:
+        print(f"Motion rejection: ON  "
+              f"(threshold={detector.threshold:.4f})")
+    else:
+        print(f"Motion rejection: OFF  (no profile)")
     print("Press Q to stop early")
 
     while not buffer.is_full():
+        # Hard wall-clock cap
+        if time.time() > wall_deadline:
+            print(f"\nMax recording time reached "
+                  f"({max_wall_time:.0f}s). "
+                  f"Stopping.")
+            break
+
         ret, frame = cap.read()
         if not ret:
             break
@@ -493,11 +474,9 @@ def run_signal_extraction(cap, actual_fps,
             frame, cv2.COLOR_BGR2RGB
         )
 
-        # Get current ITA from Step 2 if available
         if get_ita_fn is not None:
             current_ita = get_ita_fn()
 
-        # Get current ROI mask from Step 2
         combined_mask, forehead_mask, cheek_mask = \
             get_mask_fn(frame_rgb)
 
@@ -505,7 +484,6 @@ def run_signal_extraction(cap, actual_fps,
            np.sum(combined_mask) < MIN_ROI_PIXELS:
             continue
 
-        # Extract RGB with adaptive quality filter
         mean_r, mean_g, mean_b, \
         pixel_count, quality_ratio, \
         thresholds_used = extract_rgb_signal(
@@ -515,6 +493,27 @@ def run_signal_extraction(cap, actual_fps,
         if mean_g == 0.0:
             continue
 
+        # ── Motion rejection ──────────────────────
+        is_clean_frame = True
+        if motion_on:
+            is_clean_frame = detector.is_clean(mean_g)
+
+        if not is_clean_frame:
+            # Draw rejected frame indicator and skip
+            _draw_rejected_hud(
+                frame, buffer, duration_sec,
+                detector, current_ita,
+                forehead_mask, cheek_mask
+            )
+            cv2.imshow(
+                f"Signal Extraction — {modality.upper()}",
+                frame
+            )
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue
+
+        # ── Accept frame ──────────────────────────
         buffer.add_frame(
             mean_r, mean_g, mean_b,
             pixel_count, quality_ratio,
@@ -523,10 +522,9 @@ def run_signal_extraction(cap, actual_fps,
 
         # ── Display ───────────────────────────────
         progress, elapsed = buffer.get_progress()
-        remaining         = SIGNAL_DURATION_SEC - elapsed
+        remaining         = duration_sec - elapsed
         display           = frame.copy()
 
-        # Draw ROI overlays
         if forehead_mask is not None and \
            np.sum(forehead_mask) > 0:
             colored              = np.zeros_like(display)
@@ -543,7 +541,6 @@ def run_signal_extraction(cap, actual_fps,
                 colored, 0.4, display, 0.6, 0, display
             )
 
-        # HUD
         y = [30]
         def put(text, color=(0, 255, 0), scale=0.55):
             cv2.putText(display, text, (10, y[0]),
@@ -552,9 +549,8 @@ def run_signal_extraction(cap, actual_fps,
             y[0] += 26
 
         put(f"Modality: {modality.upper()}")
-        put(f"Time: {elapsed:.1f}s / "
-            f"{SIGNAL_DURATION_SEC}s  "
-            f"({remaining:.1f}s left)",
+        put(f"Clean signal: {elapsed:.1f}s / "
+            f"{duration_sec}s  ({remaining:.1f}s left)",
             (0, 255, 255))
         put(f"Frames: {len(buffer.r_signal)} / "
             f"{buffer.buffer_size}")
@@ -566,13 +562,22 @@ def run_signal_extraction(cap, actual_fps,
             (0, 255, 0) if quality_ratio > 0.7
             else (0, 165, 255)
         )
+
+        if motion_on:
+            rate = detector.get_rejection_rate()
+            put(
+                f"Rejected: {detector.rejected} frames "
+                f"({rate:.0%} artifacts)",
+                (0, 200, 255) if rate < 0.2
+                else (0, 100, 255)
+            )
+
         put(
             f"Thresholds  over:{thresholds_used[0]}"
             f"  under:{thresholds_used[1]}",
             (200, 200, 0)
         )
 
-        # Progress bar
         bar_w   = int(progress * (frame.shape[1] - 20))
         bar_col = (0, 255, 0) if quality_ratio > 0.7 \
                   else (0, 165, 255)
@@ -585,8 +590,7 @@ def run_signal_extraction(cap, actual_fps,
         cv2.rectangle(
             display,
             (10, frame.shape[0] - 30),
-            (frame.shape[1] - 10,
-             frame.shape[0] - 10),
+            (frame.shape[1] - 10, frame.shape[0] - 10),
             (100, 100, 100), 2
         )
 
@@ -600,7 +604,6 @@ def run_signal_extraction(cap, actual_fps,
 
     cv2.destroyAllWindows()
 
-    # Assess signal quality
     quality_ok, issues, snr, thresh_summary = \
         assess_signal_quality(buffer)
 
@@ -608,14 +611,16 @@ def run_signal_extraction(cap, actual_fps,
     fps_measured = buffer.get_actual_fps()
 
     print(f"\nExtraction complete:")
-    print(f"  Frames:       {len(g)}")
-    print(f"  Actual fps:   {fps_measured:.1f}")
-    print(f"  Mean quality: {buffer.get_mean_quality():.3f}")
-    print(f"  Mean ITA:     {buffer.get_mean_ita():.1f}")
-    print(f"  SNR estimate: {snr:.3f}%")
-    print(f"  Quality OK:   {quality_ok}")
+    print(f"  Clean frames:   {len(g)}")
+    print(f"  Actual fps:     {fps_measured:.1f}")
+    print(f"  Mean quality:   {buffer.get_mean_quality():.3f}")
+    print(f"  Mean ITA:       {buffer.get_mean_ita():.1f}")
+    print(f"  SNR estimate:   {snr:.3f}%")
+    print(f"  Quality OK:     {quality_ok}")
+    if motion_on:
+        detector.print_summary()
     if thresh_summary:
-        print(f"  Thresholds:   "
+        print(f"  Thresholds:     "
               f"over={thresh_summary['overexposure_mean']:.0f}"
               f"  under="
               f"{thresh_summary['underexposure_mean']:.0f}")
@@ -626,46 +631,33 @@ def run_signal_extraction(cap, actual_fps,
            quality_ok, issues, thresh_summary
 
 
-# ─────────────────────────────────────────
-# Entry point — standalone test
-# ─────────────────────────────────────────
+def _draw_rejected_hud(frame, buffer, duration_sec,
+                        detector, current_ita,
+                        forehead_mask, cheek_mask):
+    """Draw motion-rejected frame indicator."""
+    progress, elapsed = buffer.get_progress()
 
-"""if __name__ == "__main__":
-    sys.path.insert(0, os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))
-    ))
-    from step1_video_capture.step1_video_captureV3 \
-        import initialize_camera
+    # Red tint on rejected frames
+    red_overlay        = np.zeros_like(frame)
+    red_overlay[:,:,2] = 60
+    cv2.addWeighted(red_overlay, 0.3, frame, 0.7, 0, frame)
 
-    cap, actual_fps = initialize_camera(camera_index=0)
-    if cap is None:
-        print("Camera failed")
-        sys.exit(1)
-
-    # Dummy mask — center rectangle for standalone test
-    # Replace with real Step 2 mask in full pipeline
-    def dummy_mask_fn(frame_rgb):
-        h, w = frame_rgb.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        mask[h//4: 3*h//4, w//4: 3*w//4] = 1
-        return mask, mask, None
-
-    # Simulate FST VI (dark skin) for testing
-    # adaptive thresholds — replace with real ITA
-    def dummy_ita_fn():
-        return -40.0  # FST VI
-
-    r, g, b, fps, ok, issues, thresh = \
-        run_signal_extraction(
-            cap, actual_fps,
-            dummy_mask_fn,
-            dummy_ita_fn,
-            modality="test"
-        )
-
-    print(f"\nSignal shapes: {r.shape}")
-    print(f"Green mean:    {np.mean(g):.2f}")
-    print(f"Green std:     {np.std(g):.4f}")
-    print(f"Threshold summary: {thresh}")
-
-    cap.release()"""
+    cv2.putText(
+        frame,
+        "MOTION DETECTED — waiting...",
+        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+        0.65, (0, 0, 255), 2
+    )
+    cv2.putText(
+        frame,
+        f"Clean signal so far: {elapsed:.1f}s / "
+        f"{duration_sec}s",
+        (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+        0.55, (0, 200, 255), 2
+    )
+    cv2.putText(
+        frame,
+        f"Artifacts rejected: {detector.rejected}",
+        (10, 86), cv2.FONT_HERSHEY_SIMPLEX,
+        0.5, (100, 100, 255), 1
+    )

@@ -1,4 +1,5 @@
-# PulseRoute - rPPG Vital Signs System
+# PulseRoute — rPPG Vital Signs System
+
 ![Python](https://img.shields.io/badge/Python-3.10-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -20,7 +21,26 @@ This system solves that with a **dual-modality routing architecture**:
 - **Automatic palm fallback** — triggered when face signal quality is insufficient
 - **Signal quality gate** — the system decides which modality to use based on measured SNR, not assumptions about the user's appearance
 
-This means the system works for **dark skin tones**, **bearded faces**, **niqab wearers**, and any other case where the face reflects insufficient light for reliable signal extraction. The palm's signal is 31% stronger than the face in such cases (validated in peer-reviewed literature), and the routing is transparent and automatic.
+This means the system works for **dark skin tones**, **bearded faces**, **niqab wearers**, and any other case where the face reflects insufficient light. The palm signal is 31% stronger in such cases (validated in peer-reviewed literature), and the routing is automatic and transparent.
+
+---
+
+## Per-subject adaptive calibration
+
+Every fixed threshold in the pipeline has been replaced by a value derived from **the patient's own signal** during a 10-second calibration phase at startup.
+
+A `SubjectProfile` object is built during Step 2 and passed through every downstream step:
+
+| Threshold | Old approach | New approach |
+|---|---|---|
+| Motion rejection | Fixed delta of 6.0 | 5× patient's own noise floor |
+| Amplitude scoring ceiling | Fixed 0.006 | 80% of patient's own calibration amplitude |
+| Bandpass window | Always 40–180 BPM | ±30 BPM around patient's estimated HR |
+| RR filter tolerance | Fixed 40% | 30–50% based on measured signal quality |
+| Routing thresholds | Fixed 0.60 / 0.40 | ITA-adjusted per skin tone group |
+| HRV interpretation | Population average | Age-adjusted norms when age is available |
+
+This eliminates the performance gap between lab conditions and real-world teleconsultation use.
 
 ---
 
@@ -30,16 +50,14 @@ This means the system works for **dark skin tones**, **bearded faces**, **niqab 
 |---|---|---|
 | Heart Rate | POS algorithm + FFT peak detection | Primary output |
 | HRV (RMSSD) | Beat-to-beat RR interval analysis | Autonomic nervous system indicator |
-| HRV (SDNN) | Standard deviation of RR intervals | Indicative for 30s recordings |
+| HRV (SDNN) | Standard deviation of RR intervals | Indicative for short recordings |
 | Respiratory Rate | Green channel FFT analysis | Feeds adaptive bandpass filter |
-| Signal Quality Score | Multi-metric SNR | Drives face/palm routing decision |
-| Skin Tone (ITA) | BiSeNet mask photometry | Context for result interpretation |
+| Signal Quality Score | Multi-metric SNR (5 components) | Drives face/palm routing decision |
+| Skin Tone (ITA) | BiSeNet mask photometry | Used for adaptive thresholds |
 
 ---
 
 ## Pipeline architecture
-
-The system runs as a linear signal processing pipeline. Each step has a single responsibility and passes its output to the next.
 
 ```
 Camera
@@ -48,98 +66,144 @@ Camera
 Step 1 ── Camera initialization & FPS measurement
   │
   ▼
-Step 2 ── Face ROI extraction (BiSeNet semantic segmentation)
-  │        Forehead + cheeks only — excludes hair, beard, eyes
+Step 2 ── Face ROI extraction (BiSeNet) + Subject Calibration  ← 10s total
+  │        Phase 1 (0–5s):  Forehead + cheek mask via semantic segmentation
+  │        Phase 2 (5–10s): Pixel sampling → SubjectProfile
+  │        SubjectProfile passed to all downstream steps
   ▼
-Step 3 ── RGB signal extraction
-  │        Spatial average of skin pixels per frame → 3 time series
+Step 3 ── RGB signal extraction + motion rejection
+  │        Per-frame motion detector with personal threshold
+  │        Rejected frames silently skipped; recording extends automatically
   ▼
 Step 4 ── Normalization
-  │        DC removal + linear detrending → zero-mean channels
+  │        DC removal + linear detrending
   │
-  ├──────────────────────────────────────────────────────┐
-  │                                                      │
-  ▼                                                      ▼
-Step 10 ── Respiratory rate detection             (continues to Step 5)
+  ├──────────────────────────────────────────────┐
+  │                                              │
+  ▼                                             (continues)
+Step 10 ── Respiratory rate detection
   │         FFT on green channel → breathing Hz
-  │         Feeds adaptive notch + cutoff to Step 6
+  │         Feeds adaptive notch + lower cutoff to Step 6
   │
   ▼
-Step 5 ── POS pulse extraction
+Step 5 ── POS pulse extraction (Wang et al. 2017)
   │        RGB → single pulse waveform
-  │        Plane-Orthogonal-to-Skin algorithm (Wang et al. 2017)
   ▼
-Step 6 ── Adaptive bandpass filter (40–180 BPM)
-  │        Butterworth order 4, filtfilt zero-phase
-  │        Lower cutoff adapts to measured breathing frequency
+Step 6 ── Adaptive bandpass filter
+  │        Artifact clipping (±4std) before filter to prevent ringing
+  │        Bandpass narrowed around patient's estimated HR if available
+  │        Respiratory cutoff takes priority when detected
   ▼
 Step 7 ── FFT frequency analysis
   │        Time domain → power spectrum
-  │        Identifies dominant HR frequency
   ▼
-Step 8 ── Peak detection
-  │        Frequency domain: dominant HR peak with harmonic rejection
-  │        Time domain: individual beat peaks for RR intervals
+Step 8 ── Peak detection  [two-pass with Step 11 feedback]
+  │        Frequency: harmonic-support scoring selects true fundamental
+  │        Time: overlapping windows + quality-weighted deduplication
+  │        Gap filling inserts missed beats in double-length intervals
+  │        Dynamic RR tolerance tightens/loosens with signal quality
   ▼
-Step 9 ── Heart rate & HRV calculation
-  │        Combines FFT + RR estimates → final HR
-  │        Computes RMSSD, SDNN, confidence score
+Step 9 ── Heart rate & HRV (pass 1 → feeds Step 11 confidence)
+  │        Age-adjusted HRV interpretation via SubjectProfile
   ▼
-Step 11 ── Signal quality score (SNR)
-  │         Spectral SNR + dB SNR + RR regularity + amplitude
-  │         Score < 0.4 → route to palm
+Step 11 ── Signal quality score + routing decision
+  │         5-component SNR score (spectral, dB, regularity,
+  │         amplitude, confidence)
+  │         Personal amplitude ceiling from SubjectProfile
+  │         ITA-adjusted routing thresholds
+  │         score < threshold → route to palm
+  ▼
+Step 8/9 ── Second pass (quality score now known)
+  │          RR re-filtered with real quality-driven tolerance
+  │          HR/HRV recomputed from refined intervals
   ▼
 Step 12 ── Display (in development)
-           Live dashboard of all vitals
 ```
+
+---
+
+## Motion robustness
+
+Designed for real teleconsultation patients — not lab subjects:
+
+- **Coughing** → motion artifact frames silently rejected, recording extends
+- **Talking** → same rejection mechanism
+- **Swallowing** → same
+- **Slow drift** → artifact clipping in Step 6 prevents filter contamination
+- **Head turn** → missed beats recovered by gap-filling in Step 8
+- **Poor lighting** → personal amplitude scoring adapts to actual signal strength
+
+The patient does not need to stay perfectly still. The system adapts.
 
 ---
 
 ## Step-by-step detail
 
 ### Step 1 — Camera Initialization
-Opens the webcam, discards the first 30 warm-up frames, then measures real FPS over 5 seconds. The measured FPS (not the claimed FPS) is used as the timing reference for every calculation downstream. Returns the camera capture object and actual FPS.
+Opens the webcam, discards warm-up frames, measures real FPS over 5 seconds. The measured FPS (not the claimed FPS) is used as the timing reference for all downstream calculations.
 
-### Step 2 — Face ROI Extraction (BiSeNet)
-Uses a pretrained BiSeNet deep learning model to semantically parse the face into regions and extract only skin pixels from the forehead and cheeks. Unlike bounding-box approaches, this mask excludes hair, beard, eyes, and glasses. Also computes the ITA (Individual Typology Angle) as a numerical skin tone value. This step is what makes the system inclusive — it finds actual skin pixels regardless of skin tone.
+### Step 2 — Face ROI Extraction + Calibration (10s)
+**Phase 1 (0–5s):** BiSeNet semantic segmentation finds forehead and cheek pixels, excluding hair, beard, eyes, and glasses. Computes ITA (Individual Typology Angle) as a numerical skin tone value.
 
-### Step 3 — RGB Signal Extraction
-Records 30 seconds of frames and at each frame computes the spatial mean of red, green, and blue values across the masked skin pixels. With ~17,000 skin pixels per frame, individual pixel noise averages out, leaving only the systematic oscillation from blood flow. Output: three 900-sample time series (r, g, b).
+**Phase 2 (5–10s):** Pixel values are sampled through the locked mask to build a `SubjectProfile`. This profile holds the patient's personal green channel baseline, noise floor, motion threshold, amplitude target, and rough HR estimate. Every downstream threshold is derived from this profile — not population averages.
+
+### Step 3 — RGB Signal Extraction + Motion Rejection
+Records clean signal until the buffer is full. A `MotionDetector` compares each frame's green channel mean to a rolling 10-frame mean. Frames deviating by more than the patient's personal threshold are silently skipped. The buffer waits for clean frames; a red "MOTION DETECTED" indicator shows during rejections. Recording extends up to 2.5× the target duration if needed.
 
 ### Step 4 — Normalization
-Divides each channel by its temporal mean to remove absolute brightness dependence, then applies linear detrending to remove slow lighting drifts. Makes the algorithm skin-tone agnostic and drift-immune. Required input format for the POS algorithm.
+Divides each channel by its temporal mean (removes absolute brightness dependence), then applies linear detrending (removes slow lighting drift). Required input format for POS.
 
-### Step 10 — Respiratory Rate (runs before Step 5)
-Detects breathing frequency from the low-frequency oscillation in the green channel. Breathing creates a 0.1–0.5 Hz modulation through small head movements and respiratory sinus arrhythmia. Uses a narrow bandpass filter then FFT to find the dominant breathing peak. Output feeds Step 6 as an adaptive notch filter and lower cutoff, removing breathing contamination more precisely than a fixed filter.
+### Step 10 — Respiratory Rate
+Detects breathing frequency from the green channel's low-frequency oscillation. Output feeds Step 6 as an adaptive notch frequency and lower bandpass cutoff.
 
 ### Step 5 — POS Pulse Extraction
-Applies the Plane-Orthogonal-to-Skin (POS) algorithm to combine the three normalized RGB channels into a single pulse waveform. Projects the signal onto the plane orthogonal to the skin color vector, cancelling specular reflections and common-mode noise. The adaptive alpha weight balances the two projection axes based on measured signal variance, making it work across skin tones without hardcoded skin color assumptions.
+Plane-Orthogonal-to-Skin algorithm (Wang et al. 2017). Combines three normalized RGB channels into one pulse waveform by projecting onto the plane orthogonal to the skin color vector.
 
-### Step 6 — Bandpass Filter
-Applies a 4th-order Butterworth bandpass filter using filtfilt (zero-phase, forward-backward). Passes only frequencies in the 55–180 BPM range. The lower cutoff adapts based on measured breathing frequency from Step 10. The filtfilt zero-phase method eliminates timing shifts that would corrupt beat-to-beat HRV calculations. Typically improves HR band power ratio from ~5% to ~75%.
+### Step 6 — Bandpass Filter (Adaptive)
+Two preprocessing steps before the Butterworth filter:
+1. **Artifact clipping** — samples beyond ±4 standard deviations are clipped to prevent filter ringing from spikes
+2. **Profile hint** — if the patient's calibration HR estimate is available, the bandpass is narrowed to ±30 BPM around it; respiratory cutoff takes priority when detected
 
-### Step 7 — FFT Frequency Analysis
-Applies NumPy's rfft to convert the filtered pulse from time domain to frequency domain. Computes the power spectrum and identifies the frequency band corresponding to valid heart rates. Frequency resolution is approximately 2 BPM per bin for a 30-second recording at 30 FPS, within the ±3 BPM tolerance of medical device standards. Output: freqs, power, bpm_axis, SNR ratio.
+### Step 7 — FFT
+NumPy rfft converts the filtered pulse to frequency domain. Frequency resolution ≈ 1.7 BPM per bin for a 35-second recording at 30 FPS.
 
 ### Step 8 — Peak Detection
-Two parallel processes. In the frequency domain: finds all local peaks in the HR band, rejects harmonics using ratio analysis, selects the highest-power fundamental, refines frequency using quadratic interpolation between adjacent bins. In the time domain: uses FFT-guided windowing with 50% overlap and deduplication to find individual beat peaks, computes RR intervals in milliseconds, filters physiologically impossible intervals. Output feeds both HR calculation and HRV.
+**Frequency domain:** Harmonic-support scoring evaluates each candidate peak by how much energy exists at 2× and 3× its frequency. True fundamentals score higher than sub-harmonics even when raw power is similar.
+
+**Time domain:** FFT-guided overlapping windows (80% advance) find individual beat peaks. Quality-weighted deduplication prefers the beat with higher local SNR when two candidates are too close. Gap filling inserts missed beats in intervals >1.5× the median with physiological validity checks. Dynamic RR tolerance driven by `SubjectProfile.get_rr_tolerance(signal_quality)`.
+
+**Two-pass structure:** First pass uses `signal_quality=None`. After Step 11 computes the quality score, a second pass re-filters RR intervals with the real tolerance.
 
 ### Step 9 — Heart Rate & HRV
-Computes final heart rate as a weighted combination of the FFT estimate (weight 0.7) and the RR interval mean (weight 0.3). Computes RMSSD as the primary HRV metric (root mean square of successive RR differences), and SDNN as a secondary metric. Generates a confidence score from four factors: FFT SNR, HR estimate agreement, beat count, and signal quality flag. If the two HR estimates disagree by more than 10 BPM, trusts FFT only.
+Final HR: weighted combination of FFT estimate (70%) and RR mean (30%). Falls back to FFT-only if estimates disagree by >10 BPM. Computes RMSSD (primary) and SDNN (indicative for short recordings). HRV interpretation uses age-adjusted norms when `SubjectProfile.age` is set.
 
-### Step 11 — Signal Quality Score
-Computes a 0.0–1.0 quality score from four weighted metrics: spectral SNR (0.35), SNR in dB (0.25), RR interval regularity (0.25), and signal amplitude (0.15). Applies routing thresholds: score ≥ 0.6 → HIGH, score 0.4–0.6 → MEDIUM, score < 0.4 → route to palm. This is the gatekeeper — the only step that decides whether the face result is trustworthy or the palm pipeline should be invoked.
+### Step 11 — Signal Quality Score + Routing
+Five-component weighted score:
+
+| Component | Weight | What it measures |
+|---|---|---|
+| Spectral SNR | 0.30 | HR peak dominance over noise |
+| SNR in dB | 0.20 | HR band power vs total noise power |
+| RR regularity | 0.20 | Beat-to-beat consistency (CV) |
+| Amplitude | 0.15 | Signal strength vs personal target |
+| HR confidence | 0.15 | Step 9 measurement reliability |
+
+Routing thresholds adjusted for skin tone (ITA):
+- FST I–III: HIGH ≥ 0.60, MEDIUM ≥ 0.40
+- FST IV: HIGH ≥ 0.55, MEDIUM ≥ 0.35
+- FST V: HIGH ≥ 0.50, MEDIUM ≥ 0.30
+- FST VI: HIGH ≥ 0.45, MEDIUM ≥ 0.25
+
+Score below MEDIUM threshold → route to palm.
 
 ### Step 12 — Display (in development)
-Will render a real-time dashboard showing all vitals with confidence indicators, quality level, modality in use (face or palm), and a palm prompt when routing is triggered.
+Will render a live dashboard showing all vitals with confidence indicators, quality level, and palm prompt when routing is triggered.
 
 ---
 
-## Palm modality (routing target)
+## Palm modality
 
-The palm pipeline mirrors steps 3–11 but uses a different ROI. The palm has a higher density of superficial capillaries and is unaffected by hair, beard, or face covering. Signal strength is measured to be 31% higher than the face in challenging cases.
-
-Palm ROI extraction uses MediaPipe hand landmarks instead of BiSeNet. All signal processing steps (normalization, POS, bandpass, FFT, peak detection, HRV, SNR) are identical to the face pipeline.
+The palm pipeline mirrors steps 3–11 with a different ROI. The palm has higher superficial capillary density and minimal melanin variation regardless of skin tone. Signal is 31% stronger than face in challenging cases. Palm ROI extraction uses MediaPipe hand landmarks. All signal processing steps are identical to the face pipeline. Palm routing is the fallback when face quality is insufficient.
 
 ---
 
@@ -148,22 +212,19 @@ Palm ROI extraction uses MediaPipe hand landmarks instead of BiSeNet. All signal
 **Requirements:** Python 3.10, webcam
 
 ```bash
-# Clone the repo
 git clone https://github.com/arijbelmabrouk/rPPG.git
 cd rPPG
 
-# Create virtual environment
 python -m venv rppg_env
 rppg_env\Scripts\activate        # Windows
 # source rppg_env/bin/activate   # macOS/Linux
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-**Download the BiSeNet model weights** (not included in repo due to file size):
+**BiSeNet model weights** (not in repo — too large):
 
-Place the file `bisenet_resnet18.pth` at:
+Place `bisenet_resnet18.pth` at:
 ```
 step2_face_ROI_extraction/face_parsing_mask/models/bisenet_resnet18.pth
 ```
@@ -173,13 +234,13 @@ step2_face_ROI_extraction/face_parsing_mask/models/bisenet_resnet18.pth
 ## Usage
 
 ```bash
-python mainV1.py
+python run.py
 ```
 
-- The system will warm up the camera, detect your face, and begin a 30-second recording
-- Keep your face visible and stay reasonably still during recording
-- Results are printed to terminal at each pipeline step
-- If signal quality is insufficient, you will be prompted to show your palm
+- Camera warms up, face ROI is established (5s), calibration runs (5s)
+- 35-second clean signal recording begins (extends automatically if you move)
+- Results printed to terminal at each pipeline step
+- If face signal quality is insufficient, palm fallback is recommended
 
 ---
 
@@ -187,25 +248,48 @@ python mainV1.py
 
 ```
 rPPG_project/
-├── mainV1.py                          # Full pipeline (Steps 1–11)
-├── main.py                            # Steps 1–8 only (earlier version)
+├── run.py                               # Full pipeline entry point (Steps 1–11)
+├── subject_profile.py                   # Per-subject adaptive calibration profile
 │
-├── step1_video_capture/               # Camera init & FPS measurement
-├── step2_face_ROI_extraction/         # BiSeNet semantic face parsing
-│   ├── face_parsing_mask/             # BiSeNet implementation
-│   └── mediapipe_face_mesh/           # Alternative (not used in main pipeline)
-├── step2_palm_ROI_extraction/         # MediaPipe hand landmark detection
-├── step3_signal_extraction/           # RGB spatial averaging
-├── step4_normalization/               # DC removal + detrending
-├── step5_pulse_signal_extraction/     # POS algorithm
-├── step6_bandpass_filter/             # Butterworth bandpass
-├── step7_conversion_time_to_frequency/# FFT power spectrum
-├── step8_peak_detection/              # HR peak + beat detection
-├── step9_HR_HRV/                      # Final HR + RMSSD/SDNN
-├── step10_respiratory_rate/           # Breathing rate + notch filter
-├── step11_signal_quality_score/       # SNR scoring + routing decision
-└── step12_display/                    # (in development)
+├── step1_video_capture/                 # Camera init & FPS measurement
+├── step2_face_ROI_extraction/           # BiSeNet semantic face parsing
+│   └── face_parsing_mask/
+├── step2_palm_ROI_extraction/           # MediaPipe hand landmark detection
+├── step3_signal_extraction/             # RGB extraction + motion rejection
+│   ├── step3_face_signal_bisenet.py     # Face modality + calibration phase
+│   └── step3_rgb_signal.py             # Core extraction + MotionDetector
+├── step4_normalization/                 # DC removal + detrending
+├── step5_pulse_signal_extraction/       # POS algorithm (Wang et al. 2017)
+├── step6_bandpass_filter/               # Butterworth bandpass + artifact clipping
+├── step7_conversion_time_to_frequency/  # FFT power spectrum
+├── step8_peak_detection/                # HR peak + beat detection + gap filling
+├── step9_HR_HRV/                        # Final HR + RMSSD/SDNN + age norms
+├── step10_respiratory_rate/             # Breathing rate + adaptive notch
+├── step11_signal_quality_score/         # SNR scoring + ITA-adjusted routing
+└── step12_display/                      # (in development)
 ```
+
+---
+
+## Current status
+
+| Component | Status |
+|---|---|
+| Step 1 — Camera |  Complete |
+| Step 2 — Face ROI + Calibration |  Complete |
+| Step 2 — Palm ROI |  Complete |
+| Step 3 — RGB extraction + motion rejection |  Complete |
+| Step 4 — Normalization |  Complete |
+| Step 5 — POS |  Complete |
+| Step 6 — Bandpass + artifact clipping |  Complete |
+| Step 7 — FFT |  Complete |
+| Step 8 — Peak detection (all fixes) |  Complete |
+| Step 9 — HR & HRV + age norms |  Complete |
+| Step 10 — Respiratory rate |  Complete |
+| Step 11 — SNR + ITA routing |  Complete |
+| SubjectProfile — adaptive calibration |  Complete |
+| Step 12 — Display | In development |
+| Palm pipeline routing activation | In development |
 
 ---
 
@@ -213,30 +297,9 @@ rPPG_project/
 
 - **POS algorithm:** Wang, W., den Brinker, A. C., Stuijk, S., & de Haan, G. (2017). Algorithmic principles of remote PPG. *IEEE Transactions on Biomedical Engineering*, 64(7), 1479–1491.
 - **rPPG feasibility:** Verkruysse, W., Svaasand, L. O., & Nelson, J. S. (2008). Remote plethysmographic imaging using ambient light. *Optics Express*, 16(26), 21434–21445.
-- **Palm signal superiority:** Documented 31% SNR improvement over face in cases with dark skin or facial hair.
-- **HRV standards:** Task Force of the European Society of Cardiology. (1996). Heart rate variability: standards of measurement. *Circulation*, 93(5), 1043–1065.
-- **Skin tone inclusivity:** ITA-based skin classification with per-channel adaptive processing eliminates the performance gap present in landmark-based rPPG systems.
-
----
-
-## Current status
-
-| Step | Status |
-|---|---|
-| Step 1 — Camera | Complete |
-| Step 2 — Face ROI (BiSeNet) | Complete |
-| Step 2 — Palm ROI | Complete |
-| Step 3 — RGB extraction | Complete |
-| Step 4 — Normalization | Complete |
-| Step 5 — POS | Complete |
-| Step 6 — Bandpass filter | Complete |
-| Step 7 — FFT | Complete |
-| Step 8 — Peak detection | Complete |
-| Step 9 — HR & HRV | Complete |
-| Step 10 — Respiratory rate | Complete |
-| Step 11 — Signal quality & routing | Complete |
-| Step 12 — Display | In development |
-| Palm pipeline routing | In development |
+- **HRV standards:** Task Force of the European Society of Cardiology (1996). Heart rate variability: standards of measurement. *Circulation*, 93(5), 1043–1065.
+- **Age-adjusted HRV norms:** Shaffer, F., & Ginsberg, J. P. (2017). An overview of heart rate variability metrics and norms. *Frontiers in Public Health*, 5, 258. Nunan, D. et al. (2010). A quantitative systematic review of normal values for short-term heart rate variability. *PACE*, 33(11), 1407–1417.
+- **Skin tone classification:** ITA (Individual Typology Angle) per Chardon et al. (1991), mapped to Fitzpatrick scale for threshold adaptation.
 
 ---
 
