@@ -1,4 +1,4 @@
-# rPPG Vital Signs System
+# PulseRoute - rPPG Vital Signs System
 ![Python](https://img.shields.io/badge/Python-3.10-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
