@@ -1,21 +1,50 @@
-﻿rppg_env/
+# Python
 __pycache__/
 *.py[cod]
 *.pth
 *.pt
 *.bin
+
+# Virtual environment
+rppg_env/
+venv/
+.venv/
+env/
+
+# BiSeNet repo
 step2_face_ROI_extraction/face_parsing_mask/face-parsing.PyTorch/
+
+# Video / image
 *.mp4
 *.avi
+*.mov
 *.jpg
 *.jpeg
 *.png
 *.bmp
+
+# Data
+*.csv
 *.npy
 *.npz
 *.pkl
+*.h5
+
+# IDE / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+desktop.ini
+*.lnk
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Env vars
 .env
+.env.*
+
+# BFG
+..bfg-report/
