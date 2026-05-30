@@ -251,6 +251,21 @@ if __name__ == "__main__":
     n_peaks, n_harmonics = \
         find_dominant_peak(freqs, power)
 
+    # Cross-check against Step 7 FFT dominant peak.
+    # If Step 8 picked a sub-harmonic (more than 15 BPM
+    # below the FFT peak) and the FFT peak has good SNR,
+    # trust the FFT peak instead.
+    fft_dominant_bpm = fft_report.get('peak_bpm', None)
+    if fft_dominant_bpm is not None and \
+    hr_bpm is not None and \
+    fft_report.get('snr_ratio', 0) > 5.0:
+        if (fft_dominant_bpm - hr_bpm) > 15.0:
+            print(f"  Step 8 override: "
+                f"{hr_bpm:.1f} → {fft_dominant_bpm:.1f} BPM "
+                f"(FFT cross-check)")
+            hr_bpm  = fft_dominant_bpm
+            peak_hz = fft_dominant_bpm / 60.0
+
     # First pass — signal_quality unknown yet
     peak_indices, peak_times, rr_intervals, rr_tolerance = \
         detect_beat_peaks(
@@ -335,16 +350,20 @@ if __name__ == "__main__":
     print(f"Modality:      FACE")
     print(f"Heart Rate:    {hr_results['final_hr']} BPM")
     print(f"Respiratory:   "
-          f"{rr_bpm if rr_bpm else 'N/A'} BrPM")
-    print(f"RMSSD:         {hr_results['rmssd']} ms")
+        f"{rr_bpm if rr_bpm else 'N/A'} BrPM")
+    print(f"RMSSD:         {hr_results['rmssd']} ms"
+        f"{'  ⚠ LOW CONFIDENCE' if snr_report.get('std_floor_triggered') else ''}")
     print(f"HRV:           {hr_results['hrv_overall']}")
     print(f"SNR Score:     {snr_score:.4f} "
-          f"({quality_level.upper()})")
+        f"({quality_level.upper()})")
+    print(f"Routing:       "
+        f"{'⚠ PALM RECOMMENDED' if route_palm else '✓ FACE ACCEPTED'}"
+        f"{' — signal too weak for HRV' if snr_report.get('std_floor_triggered') else ''}")
     print(f"Confidence:    "
-          f"{hr_results['confidence']} "
-          f"({hr_results['confidence_level'].upper()})")
+        f"{hr_results['confidence']} "
+        f"({hr_results['confidence_level'].upper()})")
     print(f"ITA:           {face_state.ita:.1f}  "
-          f"({profile.fitzpatrick})")
+        f"({profile.fitzpatrick})")
     print(f"Profile valid: {profile.is_valid}")
     if profile.hr_estimate_bpm:
         print(f"Calib HR est:  {profile.hr_estimate_bpm} BPM")
