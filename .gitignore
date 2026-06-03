@@ -48,3 +48,5 @@ desktop.ini
 
 # BFG
 ..bfg-report/
+
+node_modules/
