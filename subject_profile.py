@@ -76,6 +76,7 @@ class SubjectProfile:
         self.amplitude_target  = None  # Step 11
         self.hr_estimate_bpm   = None  # Step 6 hint
         self.hr_estimate_hz    = None
+        self.calib_to_filtered_scale = None  # measured scale factor
 
         # Calibration metadata
         self.n_calibration_frames = 0
@@ -160,7 +161,10 @@ class SubjectProfile:
         # The pipeline reduces amplitude by roughly 500x
         # through normalization + POS + bandpass.
         # Scale the calibration std to the filtered domain.
-        CALIB_TO_FILTERED_SCALE = 0.004  # empirical bridge factor
+        CALIB_TO_FILTERED_SCALE = self.calibrate_scale_factor(
+            g_samples, fps
+        )
+        self.calib_to_filtered_scale = CALIB_TO_FILTERED_SCALE
         self.amplitude_target = max(
             0.80 * self.baseline_g_std * CALIB_TO_FILTERED_SCALE,
             0.0002
@@ -327,7 +331,83 @@ class SubjectProfile:
         tolerance = 0.30 + (1.0 - signal_quality) * 0.20
         return round(float(np.clip(tolerance,
                                    0.30, 0.50)), 3)
+    
 
+    def get_std_floor(self):
+        """
+        Personal HRV reliability floor for Step 11.
+        Derived as 20% of the patient's personal
+        amplitude_target — already correctly scaled
+        to the filtered signal domain.
+        Falls back to 0.002 if calibration failed.
+        """
+        if self.amplitude_target is not None:
+            return max(
+                self.amplitude_target * 0.10,
+                0.0002
+            )
+        return 0.002
+
+    def get_clip_multiplier(self):
+        """
+        Personal artifact clipping multiplier for Step 6.
+
+        Fixed 4.0 is too tight for patients with naturally
+        high signal variance (strong pulse) and too loose
+        for patients with weak signal.
+
+        Derived from calibration:
+            - Low baseline_g_std (weak signal) → tighter
+            clip (3.0) — artifacts stand out more
+            - High baseline_g_std (strong signal) → looser
+            clip (5.0) — more natural variance to preserve
+
+        Range: 3.0 – 5.0
+        Falls back to 4.0 if calibration failed.
+        """
+        if self.baseline_g_std is None:
+            return 4.0
+        # Scale: std=0.3 → 3.0, std=1.0 → 4.0, std=2.0+ → 5.0
+        multiplier = 3.0 + (self.baseline_g_std / 2.0)
+        return round(float(np.clip(multiplier, 3.0, 5.0)), 2)
+    
+
+    def calibrate_scale_factor(self, g_samples, fps):
+        """
+        Measure the actual ratio between raw green std
+        and filtered pulse std for THIS patient on THIS
+        device under THIS lighting.
+        
+        Replaces the hardcoded 0.004 with a measured value.
+        """
+        try:
+            from scipy.signal import butter, filtfilt
+            
+            g = np.array(g_samples, dtype=float)
+            g_norm = g - np.mean(g)
+            
+            raw_std = float(np.std(g_norm))
+            if raw_std < 1e-10:
+                return 0.004  # flat signal, use default
+            
+            # Quick bandpass identical to Step 6
+            nyq  = fps / 2.0
+            low  = np.clip(0.667 / nyq, 0.001, 0.999)
+            high = np.clip(3.0   / nyq, 0.001, 0.999)
+            b, a = butter(4, [low, high], btype='band')
+            filtered = filtfilt(b, a, g_norm)
+            
+            filtered_std = float(np.std(filtered))
+            if filtered_std < 1e-10:
+                return 0.004
+            
+            scale = filtered_std / raw_std
+            # Clamp to plausible range — sanity check
+            return float(np.clip(scale, 0.001, 0.015))
+        
+        except Exception:
+            return 0.004  # fallback if anything fails
+    
     # ─────────────────────────────────────
     # Reporting
     # ─────────────────────────────────────

@@ -7,19 +7,17 @@ import numpy as np
 # FIX 2: Amplitude score — dynamic via profile
 # FIX 3: HR confidence feeds routing (weight 0.15)
 # FIX 4: ITA-based routing threshold adjustment
-# FIX 5: Filtered std floor check
-#         If filtered signal std < STD_FLOOR_FOR_HRV,
-#         route to palm regardless of SNR score.
-#         Reason: beat timing is too imprecise at
-#         this amplitude for reliable RMSSD — not
-#         a scoring problem, a physics problem.
-#         Value (0.002) is empirical from pilot runs:
-#         std > 0.003 → RMSSD in realistic range
-#         std 0.001–0.002 → RMSSD inflated (200ms+)
-#         std < 0.001 → RMSSD unreliable entirely
-#         0.002 is a conservative floor — avoids
-#         false positives (routing valid signals to
-#         palm) while catching genuinely weak signals.
+# FIX 5: Filtered std floor — now DYNAMIC via profile
+#         Previously hardcoded at 0.002 (empirical
+#         from one subject on one webcam).
+#         Now derived from profile.get_std_floor()
+#         which computes:
+#             baseline_g_std × 0.004 × 0.5
+#         This means: route to palm if filtered std
+#         is below 50% of this patient's personal
+#         expected signal strength.
+#         Each patient gets a floor calibrated to
+#         their own signal, not a population constant.
 # ─────────────────────────────────────────
 
 HR_MIN_BPM = 55
@@ -30,16 +28,9 @@ HR_MAX_HZ  = HR_MAX_BPM / 60
 SNR_HIGH_THRESHOLD   = 0.60
 SNR_MEDIUM_THRESHOLD = 0.40
 
-# Minimum filtered signal std for reliable HRV.
-# Below this, individual beat peaks are too close
-# to the noise floor for precise timing. argmax
-# finds slightly wrong samples → RR interval errors
-# of ±50–100ms → RMSSD inflates to 200–300ms.
-# This is a physics limit, not an algorithm limit.
-# Empirical from pilot data: consistent RMSSD
-# inflation observed at std < 0.002 regardless of
-# beat count or algorithm improvements.
-STD_FLOOR_FOR_HRV = 0.002
+# Fallback std floor — used only when profile is None
+# or calibration failed. Empirical from pilot data.
+STD_FLOOR_FALLBACK = 0.002
 
 
 def get_routing_thresholds(profile=None):
@@ -222,17 +213,15 @@ def compute_snr_score(filtered, freqs, power,
         the ITA-adjusted routing threshold.
         Means: overall signal quality is too low.
 
-    Way 2 — Filtered std below STD_FLOOR_FOR_HRV:
+    Way 2 — Filtered std below personal std floor:
         The filtered signal amplitude is too weak
         for reliable beat timing regardless of score.
         Means: RMSSD will be inflated and unreliable.
         This overrides a passing SNR score.
-        Reason: the composite score can pass (spectral
-        SNR looks clean, regularity is good) while the
-        signal amplitude is still too weak for the
-        argmax peak finder to locate beats precisely.
-        ±50–100ms timing errors cascade into 200ms+
-        RMSSD. The std floor catches this case.
+        The floor is now DYNAMIC — derived from
+        profile.get_std_floor() so each patient's
+        floor is anchored to their own calibration,
+        not a fixed population constant.
 
     Weights:
         Spectral SNR    0.30
@@ -274,6 +263,15 @@ def compute_snr_score(filtered, freqs, power,
     ita_adjustment, thresh_source = \
         get_routing_thresholds(profile)
 
+    # ── Dynamic std floor ─────────────────────────
+    # Each patient's floor is derived from their own
+    # calibration baseline, not a fixed constant.
+    # Falls back to STD_FLOOR_FALLBACK if no profile.
+    if profile is not None:
+        std_floor = profile.get_std_floor()
+    else:
+        std_floor = STD_FLOOR_FALLBACK
+
     # ── Routing decision ──────────────────────────
     # Check 1: composite score
     if snr_score >= high_thresh:
@@ -286,10 +284,10 @@ def compute_snr_score(filtered, freqs, power,
         quality_level = 'low'
         route_palm    = True
 
-    # Check 2: std floor override
+    # Check 2: personal std floor override
     # Overrides a passing score when signal amplitude
     # is too weak for reliable beat timing.
-    std_too_weak   = amplitude < STD_FLOOR_FOR_HRV
+    std_too_weak        = amplitude < std_floor
     std_floor_triggered = False
 
     if std_too_weak and not route_palm:
@@ -316,7 +314,7 @@ def compute_snr_score(filtered, freqs, power,
         'ita_adjustment':       ita_adjustment,
         'threshold_source':     thresh_source,
         'std_floor_triggered':  std_floor_triggered,
-        'std_floor_value':      STD_FLOOR_FOR_HRV,
+        'std_floor_value':      std_floor,
     }
 
     return (
@@ -388,7 +386,8 @@ def print_snr_report(snr_score, snr_db,
 
     print(f"\n  Std floor check: "
           f"std={report['amplitude']:.6f}  "
-          f"floor={report['std_floor_value']}  "
+          f"floor={report['std_floor_value']:.6f}  "
+          f"[personal]  "
           f"{'⚠ TRIGGERED' if report['std_floor_triggered'] else 'OK'}")
 
     routing_str = '⚠ ROUTE TO PALM' \

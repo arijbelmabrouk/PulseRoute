@@ -47,8 +47,7 @@ FILTER_ORDER = 4
 # before filtering to prevent filter ringing.
 # 4.0 is conservative — only clips genuine spikes,
 # not real physiological variation.
-CLIP_STD_MULTIPLIER = 4.0
-
+CLIP_STD_MULTIPLIER_DEFAULT = 4.0
 
 # ─────────────────────────────────────────
 # Artifact clipping
@@ -100,8 +99,13 @@ def clip_signal_artifacts(pulse, profile=None):
         # Flat signal — nothing to clip
         return pulse.copy(), 0, 0.0, 0.0
 
-    clip_low  = signal_mean - CLIP_STD_MULTIPLIER * signal_std
-    clip_high = signal_mean + CLIP_STD_MULTIPLIER * signal_std
+    if profile is not None:
+        multiplier = profile.get_clip_multiplier()
+    else:
+        multiplier = CLIP_STD_MULTIPLIER_DEFAULT
+
+    clip_low  = signal_mean - multiplier * signal_std
+    clip_high = signal_mean + multiplier * signal_std
 
     clipped   = np.clip(pulse, clip_low, clip_high)
     n_clipped = int(np.sum(
