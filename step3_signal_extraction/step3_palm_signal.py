@@ -28,11 +28,8 @@ from step2_palm_ROI_extraction.step2_palm_detectionV5 import (
     EVAL_EVERY_N_FRAMES,
     get_landmark_pixels,
     get_combined_mask,
-    get_roi_area,
     is_palm_facing_camera,
     estimate_skin_tone,
-    assess_lighting,
-    calculate_roi_stability
 )
 from subject_profile import SubjectProfile
 
@@ -46,15 +43,16 @@ class PalmROIState:
     Shared state between Step 2 palm and Step 3.
 
     Step 2 writes mask and ITA after setup phase.
-    Step 3 reads them every frame during recording.
+    Step 3 reads — and now also UPDATES — them
+    every frame during recording via live MediaPipe.
 
     Fields:
         combined_mask   — all three palm regions combined
         thenar_mask     — thumb side region
         central_mask    — middle palm region
         hypothenar_mask — pinky side region
-        ita             — skin tone value from Step 2
-        palm_visible    — True if palm was detected
+        ita             — skin tone value
+        palm_visible    — True if palm detected this frame
     """
     def __init__(self):
         self.combined_mask   = None
@@ -75,17 +73,9 @@ def run_palm_roi_extraction(cap, actual_fps,
     Run MediaPipe palm ROI extraction + calibration.
 
     Two phases:
-        Phase 1 (0 – 5s):  Establish stable palm mask
-                            via MediaPipe Hands.
-        Phase 2 (5 – 10s): Sample green channel values
-                            through locked mask →
-                            build SubjectProfile.
-
-    Returns a SubjectProfile calibrated to this patient's
-    palm signal characteristics, NOT the face profile.
-    Palm baseline_g_std is typically higher (less melanin),
-    so motion_threshold, amplitude_target, and routing
-    thresholds all need to be re-anchored to the palm.
+        Phase 1 (first half): Establish stable palm mask.
+        Phase 2 (second half): Sample green channel values
+            through mask → build SubjectProfile.
 
     Input:
         cap          — VideoCapture from Step 1
@@ -96,8 +86,8 @@ def run_palm_roi_extraction(cap, actual_fps,
     Output:
         palm_profile — SubjectProfile built from palm signal
     """
-    mask_phase_sec  = duration_sec / 2.0   # 5s
-    calib_phase_sec = duration_sec / 2.0   # 5s
+    mask_phase_sec  = duration_sec / 2.0
+    calib_phase_sec = duration_sec / 2.0
 
     frame_counter = 0
     cached_ita    = 0.0
@@ -133,118 +123,32 @@ def run_palm_roi_extraction(cap, actual_fps,
             if results.multi_hand_landmarks:
                 landmarks  = results.multi_hand_landmarks[0].landmark
                 handedness = results.multi_handedness[0]
-
                 palm_facing, _ = is_palm_facing_camera(
                     landmarks, handedness
                 )
 
                 if palm_facing:
                     palm_visible = True
-
-                    thenar_pts = get_landmark_pixels(
-                        landmarks, THENAR_LANDMARKS,
+                    _update_state_from_landmarks(
+                        state, landmarks,
                         frame_w, frame_h
                     )
-                    central_pts = get_landmark_pixels(
-                        landmarks, CENTRAL_PALM_LANDMARKS,
-                        frame_w, frame_h
-                    )
-                    hypothenar_pts = get_landmark_pixels(
-                        landmarks, HYPOTHENAR_LANDMARKS,
-                        frame_w, frame_h
-                    )
-
-                    thenar_mask     = np.zeros(
-                        (frame_h, frame_w), dtype=np.uint8
-                    )
-                    central_mask    = np.zeros(
-                        (frame_h, frame_w), dtype=np.uint8
-                    )
-                    hypothenar_mask = np.zeros(
-                        (frame_h, frame_w), dtype=np.uint8
-                    )
-
-                    for pts, msk in [
-                        (thenar_pts,     thenar_mask),
-                        (central_pts,    central_mask),
-                        (hypothenar_pts, hypothenar_mask)
-                    ]:
-                        if len(pts) >= 3:
-                            cv2.fillPoly(
-                                msk,
-                                [np.array(pts, dtype=np.int32)],
-                                1
-                            )
-
-                    combined_mask = get_combined_mask(
-                        [thenar_pts, central_pts,
-                         hypothenar_pts],
-                        frame_h, frame_w
-                    )
-
-                    if frame_counter % EVAL_EVERY_N_FRAMES == 0:
+                    if frame_counter % EVAL_EVERY_N_FRAMES == 0 \
+                       and state.combined_mask is not None:
                         _, cached_ita = estimate_skin_tone(
-                            frame, combined_mask
+                            frame, state.combined_mask
                         )
+                        state.ita = cached_ita
 
-                    state.combined_mask   = combined_mask
-                    state.thenar_mask     = thenar_mask
-                    state.central_mask    = central_mask
-                    state.hypothenar_mask = hypothenar_mask
-                    state.ita             = cached_ita
-                    state.palm_visible    = True
-
-            # Phase 1 preview
-            display = frame.copy()
-            for msk, color in [
-                (state.thenar_mask,     (0, 255, 0)),
-                (state.central_mask,    (0, 255, 255)),
-                (state.hypothenar_mask, (255, 0, 0))
-            ]:
-                if msk is not None and np.sum(msk) > 0:
-                    colored         = np.zeros_like(display)
-                    colored[msk==1] = color
-                    cv2.addWeighted(
-                        colored, 0.4, display,
-                        0.6, 0, display
-                    )
-
-            remaining = max(0, phase1_end - time.time())
-            cv2.putText(
-                display,
-                f"Phase 1 — Palm mask setup... {remaining:.1f}s",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0) if palm_visible else (0, 0, 255),
-                2
+            _draw_phase_hud(
+                frame, state, palm_visible, cached_ita,
+                max(0, phase1_end - time.time()),
+                "Phase 1 — Palm mask setup"
             )
-            cv2.putText(
-                display,
-                f"ITA: {cached_ita:.1f}  "
-                f"{'Palm detected' if palm_visible else 'Show palm to camera'}",
-                (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (0, 255, 255), 2
-            )
-            cv2.putText(
-                display,
-                "GREEN=Thenar  CYAN=Central  BLUE=Hypothenar",
-                (10, display.shape[0] - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4, (255, 255, 255), 1
-            )
-            cv2.imshow("Step 2b — Palm ROI", display)
+            cv2.imshow("Step 2b — Palm ROI", frame)
             cv2.waitKey(1)
 
     # ── Phase 2: Calibration sampling ─────────────
-    # Collect green channel values through locked mask.
-    # Mirror of face calibration in step3_face_signal_bisenet.py.
-    # The palm's baseline_g_std is higher than face (less melanin),
-    # so the SubjectProfile built here will have:
-    #   - higher motion_threshold (5× palm baseline, not face)
-    #   - higher amplitude_target (anchored to palm signal strength)
-    #   - bandpass hint from palm HR estimate
-    #   - ITA from palm (lighter than face regardless of skin tone)
-
     print(f"\nStep 2b Palm — Phase 2: Calibration sampling "
           f"({calib_phase_sec:.0f}s)...")
     print("Hold still — measuring your palm signal baseline")
@@ -253,10 +157,8 @@ def run_palm_roi_extraction(cap, actual_fps,
     phase2_end      = time.time() + calib_phase_sec
 
     if state.combined_mask is None:
-        print("  WARNING: No palm mask established — "
-              "calibration will use defaults")
-        # Return a default profile so the pipeline doesn't crash
-        profile = SubjectProfile()
+        print("  WARNING: No palm mask — using defaults")
+        profile             = SubjectProfile()
         profile.ita         = state.ita
         profile.fitzpatrick = _ita_to_fitzpatrick(state.ita)
         cv2.destroyAllWindows()
@@ -279,7 +181,6 @@ def run_palm_roi_extraction(cap, actual_fps,
                 frame, cv2.COLOR_BGR2RGB
             )
 
-            # Keep updating mask if palm still visible
             results = hands.process(frame_rgb)
             if results.multi_hand_landmarks:
                 landmarks  = results.multi_hand_landmarks[0].landmark
@@ -288,27 +189,10 @@ def run_palm_roi_extraction(cap, actual_fps,
                     landmarks, handedness
                 )
                 if palm_facing:
-                    thenar_pts = get_landmark_pixels(
-                        landmarks, THENAR_LANDMARKS,
-                        frame_w, frame_h
+                    _update_state_from_landmarks(
+                        state, landmarks, frame_w, frame_h
                     )
-                    central_pts = get_landmark_pixels(
-                        landmarks, CENTRAL_PALM_LANDMARKS,
-                        frame_w, frame_h
-                    )
-                    hypothenar_pts = get_landmark_pixels(
-                        landmarks, HYPOTHENAR_LANDMARKS,
-                        frame_w, frame_h
-                    )
-                    combined_mask = get_combined_mask(
-                        [thenar_pts, central_pts,
-                         hypothenar_pts],
-                        frame_h, frame_w
-                    )
-                    if np.sum(combined_mask) > 100:
-                        state.combined_mask = combined_mask
 
-            # Sample green channel through locked mask
             mask = state.combined_mask
             if mask is not None and np.sum(mask) > 100:
                 green_channel = frame[:, :, 1].astype(np.float32)
@@ -317,66 +201,65 @@ def run_palm_roi_extraction(cap, actual_fps,
                 ))
                 g_calib_samples.append(mean_g)
 
-            # Phase 2 preview
-            display   = frame.copy()
-            remaining = max(0, phase2_end - time.time())
-            n_samples = len(g_calib_samples)
-
-            cv2.putText(
-                display,
-                f"Phase 2 — Calibrating... {remaining:.1f}s",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (255, 255, 0), 2
+            _draw_phase_hud(
+                frame, state, True, state.ita,
+                max(0, phase2_end - time.time()),
+                f"Phase 2 — Calibrating "
+                f"({len(g_calib_samples)} samples)"
             )
-            cv2.putText(
-                display,
-                f"Samples: {n_samples}  "
-                f"Hold still",
-                (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (0, 255, 255), 2
-            )
-            cv2.imshow("Step 2b — Palm ROI", display)
+            cv2.imshow("Step 2b — Palm ROI", frame)
             cv2.waitKey(1)
 
     cv2.destroyAllWindows()
 
-    # ── Build SubjectProfile from palm calibration ─
-    g_arr = np.array(g_calib_samples, dtype=np.float32)
-
+    # ── Build SubjectProfile ───────────────────────
+    g_arr        = np.array(g_calib_samples, dtype=np.float32)
     palm_profile = SubjectProfile()
     palm_profile.build_from_calibration(
         g_samples = g_arr,
-        r_samples = g_arr,   # palm: only green collected, r/b approximate
+        r_samples = g_arr,
         b_samples = g_arr,
         ita_value = state.ita,
         fps       = actual_fps
     )
 
+    # ── Validate calibration ───────────────────────
     mask_pixels = int(np.sum(state.combined_mask)) \
-        if state.combined_mask is not None else 0
+                  if state.combined_mask is not None else 0
+    valid, reason = palm_profile.validate(
+        mask_pixels=mask_pixels
+    )
+    if not valid:
+        print(f"\n  ⚠ Palm calibration validation failed:")
+        print(f"  {reason}")
+        print(f"  Using population defaults.")
+        palm_profile._set_population_defaults()
+        palm_profile.ita         = state.ita
+        palm_profile.fitzpatrick = _ita_to_fitzpatrick(state.ita)
 
     print(
         f"\nStep 2b Palm complete —"
-        f"\n  ITA:              {state.ita:.1f}  "
+        f"\n  ITA:                 {state.ita:.1f}  "
         f"({palm_profile.fitzpatrick})"
         f"\n  Calibration samples: {len(g_calib_samples)}"
-        f"\n  Palm baseline std:   "
-        f"{palm_profile.baseline_g_std:.4f}"
-        f"\n  Motion threshold:    "
-        f"{palm_profile.motion_threshold:.4f}"
-        f"\n  Amplitude target:    "
-        f"{palm_profile.amplitude_target:.6f}"
-        f"\n  HR estimate:         "
-        f"{palm_profile.hr_estimate_bpm} BPM"
-        f"\n  Mask pixels:         {mask_pixels}"
         f"\n  Profile valid:       {palm_profile.is_valid}"
     )
+    if palm_profile.baseline_g_std is not None:
+        print(
+            f"  Baseline std:        "
+            f"{palm_profile.baseline_g_std:.4f}"
+            f"\n  Motion threshold:    "
+            f"{palm_profile.motion_threshold:.4f}"
+            f"\n  Amplitude target:    "
+            f"{palm_profile.amplitude_target:.6f}"
+        )
 
     return palm_profile
 
 
 # ─────────────────────────────────────────
 # Step 3b — RGB signal extraction (palm)
+# with live mask refresh every frame
 # ─────────────────────────────────────────
 
 def run_palm_signal_extraction(cap, actual_fps, state,
@@ -385,15 +268,23 @@ def run_palm_signal_extraction(cap, actual_fps, state,
     """
     Run Step 3 RGB signal extraction using palm mask.
 
-    Receives cap from Step 1 and state from Step 2b.
-    Does NOT open camera.
+    KEY CHANGE — live mask refresh every frame:
+        The original implementation locked the palm mask
+        at setup time. Any hand movement during the 35s
+        recording would point the mask at wrong pixels.
 
-    The mask from state is locked after setup phase.
-    This function reads pixels from the locked mask
-    for duration_sec seconds.
+        This version opens a MediaPipe Hands session that
+        runs alongside the signal extraction. get_mask_fn
+        is a closure that:
+            1. Runs MediaPipe on the current frame
+            2. Updates state.combined_mask if palm detected
+            3. Falls back to the last known mask if not
 
-    Motion rejection uses palm_profile.motion_threshold —
-    calibrated to the palm's own baseline, not the face.
+        The patient can move their hand slightly and the
+        mask follows. If the palm disappears completely,
+        the last valid mask is held until it reappears.
+        Motion rejection (from profile) handles frames
+        where the palm moved too fast to track cleanly.
 
     Input:
         cap          — VideoCapture from Step 1
@@ -409,7 +300,71 @@ def run_palm_signal_extraction(cap, actual_fps, state,
         issues         — list of problem strings
         thresh_summary — adaptive threshold stats dict
     """
+    print(f"\nStep 3b: Extracting RGB signal from palm "
+          f"({duration_sec}s) — live mask tracking active...")
+
+    # Open a single MediaPipe session for the full recording.
+    # The hands context stays open while run_signal_extraction
+    # calls get_mask_fn on every frame.
+    hands_context = mp_hands.Hands(
+        max_num_hands=1,
+        model_complexity=0,       # complexity 0 = faster,
+                                  # important at 30fps with
+                                  # signal extraction overhead
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.5
+    )
+    hands_context.__enter__()
+
+    frame_counter   = [0]   # mutable int in closure
+    ita_counter     = [0]
+
     def get_mask_fn(frame_rgb):
+        """
+        Called by run_signal_extraction on every frame.
+
+        Runs MediaPipe, updates state mask if palm found,
+        falls back to last known mask if not.
+
+        Returns (combined, thenar, central) tuple.
+        """
+        frame_counter[0] += 1
+
+        results = hands_context.process(frame_rgb)
+
+        if results.multi_hand_landmarks:
+            landmarks  = results.multi_hand_landmarks[0].landmark
+            handedness = results.multi_handedness[0]
+
+            palm_facing, _ = is_palm_facing_camera(
+                landmarks, handedness
+            )
+
+            if palm_facing:
+                h, w = frame_rgb.shape[:2]
+                _update_state_from_landmarks(
+                    state, landmarks, w, h
+                )
+                state.palm_visible = True
+
+                # Update ITA every N frames — expensive
+                if frame_counter[0] % EVAL_EVERY_N_FRAMES == 0:
+                    # frame_rgb is RGB, convert for estimate_skin_tone
+                    frame_bgr = cv2.cvtColor(
+                        frame_rgb, cv2.COLOR_RGB2BGR
+                    )
+                    if state.combined_mask is not None:
+                        _, new_ita = estimate_skin_tone(
+                            frame_bgr, state.combined_mask
+                        )
+                        state.ita = new_ita
+            else:
+                # Palm turned away — hold last mask
+                state.palm_visible = False
+        else:
+            # No hand detected — hold last mask
+            state.palm_visible = False
+
         return (
             state.combined_mask,
             state.thenar_mask,
@@ -419,24 +374,120 @@ def run_palm_signal_extraction(cap, actual_fps, state,
     def get_ita_fn():
         return state.ita
 
-    print("\nStep 3b: Extracting RGB signal from palm "
-          f"({duration_sec}s)...")
+    try:
+        result = run_signal_extraction(
+            cap, actual_fps,
+            get_mask_fn, get_ita_fn,
+            modality     = "palm",
+            duration_sec = duration_sec,
+            profile      = profile
+        )
+    finally:
+        # Always close MediaPipe even if extraction fails
+        hands_context.__exit__(None, None, None)
 
-    return run_signal_extraction(
-        cap, actual_fps,
-        get_mask_fn, get_ita_fn,
-        modality    = "palm",
-        duration_sec = duration_sec,
-        profile      = profile
+    return result
+
+
+# ─────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────
+
+def _update_state_from_landmarks(state, landmarks,
+                                   frame_w, frame_h):
+    """
+    Rebuild all palm masks from current landmarks.
+    Writes directly to state. Called every frame
+    when palm is visible and facing camera.
+    """
+    thenar_pts = get_landmark_pixels(
+        landmarks, THENAR_LANDMARKS, frame_w, frame_h
+    )
+    central_pts = get_landmark_pixels(
+        landmarks, CENTRAL_PALM_LANDMARKS, frame_w, frame_h
+    )
+    hypothenar_pts = get_landmark_pixels(
+        landmarks, HYPOTHENAR_LANDMARKS, frame_w, frame_h
+    )
+
+    thenar_mask     = np.zeros(
+        (frame_h, frame_w), dtype=np.uint8
+    )
+    central_mask    = np.zeros(
+        (frame_h, frame_w), dtype=np.uint8
+    )
+    hypothenar_mask = np.zeros(
+        (frame_h, frame_w), dtype=np.uint8
+    )
+
+    for pts, msk in [
+        (thenar_pts,     thenar_mask),
+        (central_pts,    central_mask),
+        (hypothenar_pts, hypothenar_mask)
+    ]:
+        if len(pts) >= 3:
+            cv2.fillPoly(
+                msk,
+                [np.array(pts, dtype=np.int32)],
+                1
+            )
+
+    combined_mask = get_combined_mask(
+        [thenar_pts, central_pts, hypothenar_pts],
+        frame_h, frame_w
+    )
+
+    # Only update if the new mask is non-empty
+    if np.sum(combined_mask) > 100:
+        state.combined_mask   = combined_mask
+        state.thenar_mask     = thenar_mask
+        state.central_mask    = central_mask
+        state.hypothenar_mask = hypothenar_mask
+        state.palm_visible    = True
+
+
+def _draw_phase_hud(frame, state, palm_visible,
+                     cached_ita, remaining, label):
+    """Draw phase HUD overlay."""
+    frame_h = frame.shape[0]
+
+    for msk, color in [
+        (state.thenar_mask,     (0, 255, 0)),
+        (state.central_mask,    (0, 255, 255)),
+        (state.hypothenar_mask, (255, 0, 0))
+    ]:
+        if msk is not None and np.sum(msk) > 0:
+            colored         = np.zeros_like(frame)
+            colored[msk==1] = color
+            cv2.addWeighted(
+                colored, 0.4, frame, 0.6, 0, frame
+            )
+
+    status_color = (0, 255, 0) if palm_visible \
+                   else (0, 0, 255)
+
+    cv2.putText(
+        frame, f"{label}  {remaining:.1f}s",
+        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+        0.65, status_color, 2
+    )
+    cv2.putText(
+        frame,
+        f"ITA: {cached_ita:.1f}  "
+        f"{'Palm detected' if palm_visible else 'Show palm'}",
+        (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+        0.6, (0, 255, 255), 2
+    )
+    cv2.putText(
+        frame,
+        "GREEN=Thenar  CYAN=Central  BLUE=Hypothenar",
+        (10, frame_h - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4, (255, 255, 255), 1
     )
 
 
-# ─────────────────────────────────────────
-# Internal helper
-# ─────────────────────────────────────────
-
 def _ita_to_fitzpatrick(ita):
-    """Map ITA value to Fitzpatrick type string."""
     if   ita > 55:  return "FST I"
     elif ita > 41:  return "FST II"
     elif ita > 28:  return "FST III"

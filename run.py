@@ -398,10 +398,21 @@ if __name__ == "__main__":
     print(f"Heart Rate:    {hr_results['final_hr']} BPM")
     print(f"Respiratory:   "
           f"{rr_bpm if rr_bpm else 'N/A'} BrPM")
-    print(f"RMSSD:         {hr_results['rmssd']} ms"
-          f"{'  ⚠ LOW CONFIDENCE' if snr_report.get('std_floor_triggered') else ''}")
-    print(f"HRV:           {hr_results['hrv_overall']}")
-    print(f"SNR Score:     {snr_score:.4f} "
+    if hr_results['hrv_available']:
+        rmssd_line = f"{hr_results['rmssd']} ms" \
+                     if hr_results['rmssd'] is not None \
+                     else "Insufficient beats"
+        if snr_report.get('std_floor_triggered'):
+            rmssd_line += "  ⚠ LOW CONFIDENCE"
+        if hr_results['hrv_confidence'] == "low":
+            rmssd_line += "  ⚠ LOW CONFIDENCE (60fps)"
+        print(f"RMSSD:         {rmssd_line}")
+        print(f"HRV:           {hr_results['hrv_overall']}")
+    else:
+        print(f"RMSSD:         ✗ Not reported "
+              f"({hr_results['hrv_fps_message']})")
+        print(f"HRV:           Requires 60fps+ camera")    
+        print(f"SNR Score:     {snr_score:.4f} "
           f"({quality_level.upper()})")
     print(f"Routing:       "
           f"{'⚠ PALM RECOMMENDED' if route_palm else '✓ FACE ACCEPTED'}"
@@ -490,9 +501,20 @@ if __name__ == "__main__":
         print(f"Heart Rate:    {hr_results['final_hr']} BPM")
         print(f"Respiratory:   "
               f"{rr_bpm if rr_bpm else 'N/A'} BrPM")
-        print(f"RMSSD:         {hr_results['rmssd']} ms"
-              f"{'  ⚠ LOW CONFIDENCE' if snr_report.get('std_floor_triggered') else ''}")
-        print(f"HRV:           {hr_results['hrv_overall']}")
+        if hr_results['hrv_available']:
+            rmssd_line = f"{hr_results['rmssd']} ms" \
+                        if hr_results['rmssd'] is not None \
+                        else "Insufficient beats"
+            if snr_report.get('std_floor_triggered'):
+                rmssd_line += "  ⚠ LOW CONFIDENCE"
+            if hr_results['hrv_confidence'] == "low":
+                rmssd_line += "  ⚠ LOW CONFIDENCE (60fps)"
+            print(f"RMSSD:         {rmssd_line}")
+            print(f"HRV:           {hr_results['hrv_overall']}")
+        else:
+            print(f"RMSSD:         ✗ Not reported "
+                f"({hr_results['hrv_fps_message']})")
+            print(f"HRV:           Requires 60fps+ camera")
         print(f"SNR Score:     {snr_score:.4f} "
               f"({quality_level.upper()})")
         print(f"Routing:       "

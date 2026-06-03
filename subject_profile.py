@@ -24,6 +24,26 @@ import numpy as np
 # Passed through the entire pipeline.
 # ─────────────────────────────────────────
 
+# ── Calibration quality bounds ─────────────────
+# baseline_g_std bounds:
+#   Too low  (< 0.05): face not detected, static image,
+#                      or covered — no real signal
+#   Too high (> 3.0):  occluded face, hand in front,
+#                      strong motion during calibration,
+#                      or very poor lighting
+#
+# These bounds come from empirical pilot data.
+# Normal face calibration: 0.1 – 1.5
+# Normal palm calibration: 0.5 – 3.0 (stronger signal)
+CALIB_STD_MIN  = 0.05
+CALIB_STD_MAX  = 3.0
+
+# Minimum pixel count for a usable mask
+CALIB_MIN_MASK_PIXELS = 500
+
+# Minimum calibration frames for a valid profile
+CALIB_MIN_FRAMES = 30
+
 
 class SubjectProfile:
     """
@@ -40,7 +60,7 @@ class SubjectProfile:
         baseline_g_std   — green channel noise floor
         baseline_r_mean  — mean red at rest
         baseline_b_mean  — mean blue at rest
-        motion_threshold — 3× personal noise floor
+        motion_threshold — 5× personal noise floor
                            for frame rejection
         amplitude_target — 80% of personal best
                            signal amplitude seen
@@ -50,14 +70,19 @@ class SubjectProfile:
         hr_estimate_hz   — same in Hz
         n_calibration_frames — frames used to build
                                this profile
-        is_valid         — True when enough data
-                           was collected (≥100 frames)
+        is_valid         — True when enough good data
+                           was collected
+        validation_reason — why validation failed
+                            (None if valid)
 
     Dynamic threshold methods:
         get_motion_threshold()  — for Step 3
         get_amplitude_target()  — for Step 11
         get_bandpass_hint()     — for Step 6
         get_rr_tolerance()      — for Step 8
+        get_std_floor()         — for Step 11
+        get_clip_multiplier()   — for Step 6
+        validate()              — quality gate
     """
 
     def __init__(self):
@@ -72,15 +97,126 @@ class SubjectProfile:
         self.baseline_b_mean = None
 
         # Dynamic thresholds (computed after calibration)
-        self.motion_threshold  = None  # Step 3
-        self.amplitude_target  = None  # Step 11
-        self.hr_estimate_bpm   = None  # Step 6 hint
-        self.hr_estimate_hz    = None
-        self.calib_to_filtered_scale = None  # measured scale factor
+        self.motion_threshold        = None
+        self.amplitude_target        = None
+        self.hr_estimate_bpm         = None
+        self.hr_estimate_hz          = None
+        self.calib_to_filtered_scale = None
 
         # Calibration metadata
         self.n_calibration_frames = 0
         self.is_valid             = False
+        self.validation_reason    = None
+
+    # ─────────────────────────────────────
+    # Calibration quality gate
+    # ─────────────────────────────────────
+
+    def validate(self, mask_pixels=None):
+        """
+        Check whether this calibration profile is
+        trustworthy enough to proceed with recording.
+
+        Called after build_from_calibration in Step 2.
+        If this returns False, Step 2 should prompt
+        the patient to reposition and retry — not
+        silently proceed with garbage thresholds.
+
+        Checks:
+            1. Enough calibration frames collected
+            2. Green std is within plausible range
+               (not too low = no face,
+                not too high = occluded/moving)
+            3. Mask has enough pixels (face visible)
+            4. Green mean is in a plausible range
+               (not pure black, not overexposed)
+
+        Input:
+            mask_pixels — int pixel count of ROI mask
+                          (optional, from state)
+
+        Output:
+            valid  — bool
+            reason — string explaining failure
+                     (None if valid)
+        """
+        # Check 1 — enough frames
+        if self.n_calibration_frames < CALIB_MIN_FRAMES:
+            reason = (
+                f"Too few calibration frames: "
+                f"{self.n_calibration_frames} "
+                f"(need {CALIB_MIN_FRAMES}). "
+                f"Face may not have been visible."
+            )
+            self.is_valid          = False
+            self.validation_reason = reason
+            return False, reason
+
+        # Check 2 — green std in plausible range
+        if self.baseline_g_std is None:
+            reason = "Calibration failed — no signal data."
+            self.is_valid          = False
+            self.validation_reason = reason
+            return False, reason
+
+        if self.baseline_g_std < CALIB_STD_MIN:
+            reason = (
+                f"Signal too flat: std={self.baseline_g_std:.4f} "
+                f"(min {CALIB_STD_MIN}). "
+                f"Face may be covered or camera blocked."
+            )
+            self.is_valid          = False
+            self.validation_reason = reason
+            return False, reason
+
+        if self.baseline_g_std > CALIB_STD_MAX:
+            reason = (
+                f"Signal too noisy: std={self.baseline_g_std:.4f} "
+                f"(max {CALIB_STD_MAX}). "
+                f"Patient moved during calibration, "
+                f"face was partially occluded, "
+                f"or lighting changed suddenly."
+            )
+            self.is_valid          = False
+            self.validation_reason = reason
+            return False, reason
+
+        # Check 3 — mask has enough pixels
+        if mask_pixels is not None and \
+           mask_pixels < CALIB_MIN_MASK_PIXELS:
+            reason = (
+                f"ROI too small: {mask_pixels} pixels "
+                f"(need {CALIB_MIN_MASK_PIXELS}). "
+                f"Move closer to the camera."
+            )
+            self.is_valid          = False
+            self.validation_reason = reason
+            return False, reason
+
+        # Check 4 — green mean in plausible range
+        if self.baseline_g_mean is not None:
+            if self.baseline_g_mean < 10:
+                reason = (
+                    f"Face too dark: mean_g={self.baseline_g_mean:.1f}. "
+                    f"Improve lighting — face is underlit."
+                )
+                self.is_valid          = False
+                self.validation_reason = reason
+                return False, reason
+
+            if self.baseline_g_mean > 245:
+                reason = (
+                    f"Face overexposed: mean_g={self.baseline_g_mean:.1f}. "
+                    f"Reduce direct light on face or "
+                    f"move away from bright source."
+                )
+                self.is_valid          = False
+                self.validation_reason = reason
+                return False, reason
+
+        self.is_valid          = True
+        self.validation_reason = None
+        return True, None
 
     # ─────────────────────────────────────
     # Build from calibration data
@@ -115,9 +251,7 @@ class SubjectProfile:
             self.ita
         )
 
-        if len(g) < 30:
-            # Not enough calibration data
-            # Fall back to population defaults
+        if len(g) < CALIB_MIN_FRAMES:
             self._set_population_defaults()
             return
 
@@ -128,39 +262,12 @@ class SubjectProfile:
         self.baseline_b_mean = float(np.mean(b))
 
         # ── Motion threshold ───────────────────
-        # 3× the patient's own noise floor.
-        # A frame whose green channel deviates by
-        # more than this from the rolling mean is
-        # a motion artifact (cough, movement, etc).
-        #
-        # This is personal — a fidgety patient has
-        # a higher natural variation, so their
-        # threshold is proportionally higher too.
-        # Fixed thresholds punish them unfairly.
-        #
-        # Minimum of 0.5 so threshold is never zero
-        # on very stable signals.
         self.motion_threshold = max(
             5.0 * self.baseline_g_std,
             2.0
         )
 
         # ── Amplitude target ───────────────────
-        # 80% of the patient's own best green std
-        # seen during calibration.
-        # Step 11 amplitude score uses this as
-        # the ceiling instead of a fixed 0.006.
-        #
-        # A dark-skinned patient under home lighting
-        # may only reach std=0.001 — this is their
-        # honest best, and scoring them against a
-        # lab benchmark of 0.006 is unfair.
-        # AFTER
-        # Raw green std is ~0.3-2.0
-        # Filtered pulse std is ~0.0005-0.003
-        # The pipeline reduces amplitude by roughly 500x
-        # through normalization + POS + bandpass.
-        # Scale the calibration std to the filtered domain.
         CALIB_TO_FILTERED_SCALE = self.calibrate_scale_factor(
             g_samples, fps
         )
@@ -171,9 +278,6 @@ class SubjectProfile:
         )
 
         # ── Rough HR estimate from calibration ─
-        # 5 seconds is barely enough for a reliable
-        # HR estimate, so we only use it to narrow
-        # the bandpass hint — not as a final result.
         if len(g) >= int(fps * 5):
             hr_est = self._estimate_hr_from_signal(
                 g, fps
@@ -187,29 +291,24 @@ class SubjectProfile:
     def _estimate_hr_from_signal(self, g_signal, fps):
         """
         Rough HR estimate from short calibration signal.
-        Used only as bandpass hint — not a result.
-
+        Used only as bandpass hint — not a final result.
         Returns BPM float or None if unreliable.
         """
         try:
             from scipy.signal import butter, filtfilt
             from scipy.fft import rfft, rfftfreq
 
-            # Quick bandpass 0.667–3.0 Hz
             nyq    = fps / 2.0
             low    = 0.667 / nyq
             high   = min(3.0 / nyq, 0.99)
-            b, a   = butter(2, [low, high],
-                            btype='band')
+            b, a   = butter(2, [low, high], btype='band')
             filtered = filtfilt(b, a, g_signal)
 
-            # FFT
             N      = len(filtered)
             freqs  = rfftfreq(N, d=1.0 / fps)
             power  = np.abs(rfft(filtered)) ** 2
 
-            hr_mask = (freqs >= 0.667) & \
-                      (freqs <= 3.0)
+            hr_mask = (freqs >= 0.667) & (freqs <= 3.0)
             if hr_mask.sum() == 0:
                 return None
 
@@ -217,7 +316,6 @@ class SubjectProfile:
             peak_hz  = freqs[hr_mask][peak_idx]
             peak_bpm = peak_hz * 60.0
 
-            # Only trust if in plausible range
             if 45 <= peak_bpm <= 150:
                 return round(float(peak_bpm), 1)
             return None
@@ -226,7 +324,6 @@ class SubjectProfile:
             return None
 
     def _ita_to_fitzpatrick(self, ita):
-        """Map ITA angle to Fitzpatrick type string."""
         if ita > 55:
             return "FST I-II"
         elif ita > 28:
@@ -242,178 +339,87 @@ class SubjectProfile:
         """
         Fallback when calibration data insufficient.
         Uses conservative population-average values.
+        is_valid stays False — flag as fallback.
         """
         self.baseline_g_mean  = 120.0
         self.baseline_g_std   = 2.0
         self.baseline_r_mean  = 100.0
         self.baseline_b_mean  = 80.0
-        self.motion_threshold = 6.0   # 3 × 2.0
+        self.motion_threshold = 6.0
         self.amplitude_target = 0.001
-        self.is_valid         = False  # flag as fallback
+        self.is_valid         = False
 
     # ─────────────────────────────────────
     # Dynamic threshold getters
-    # (used by downstream steps)
     # ─────────────────────────────────────
 
     def get_motion_threshold(self):
-        """
-        Per-frame motion rejection threshold for Step 3.
-
-        A frame whose green channel deviates from the
-        rolling mean by more than this value is a
-        motion artifact and should be skipped.
-
-        Returns patient's personal threshold (5× their
-        own noise floor) or a safe default if calibration
-        was incomplete.
-        """
         if self.motion_threshold is not None:
             return self.motion_threshold
-        return 6.0  # safe fallback
+        return 6.0
 
     def get_amplitude_target(self):
-        """
-        Personal amplitude ceiling for Step 11 scoring.
-
-        Step 11 uses this instead of a fixed 0.006 ceiling
-        so dark-skinned / low-light patients are scored
-        against their own realistic best, not a lab benchmark.
-        """
         if self.amplitude_target is not None:
             return self.amplitude_target
-        return 0.001  # conservative fallback
+        return 0.001
 
     def get_bandpass_hint(self):
-        """
-        Rough HR estimate for Step 6 bandpass tuning.
-
-        Returns (low_hz, high_hz) window around the
-        estimated HR ± 30 BPM.
-        Returns None if calibration HR estimate
-        was not reliable enough.
-        """
         if self.hr_estimate_hz is None:
             return None
-
-        margin_hz = 30.0 / 60.0  # ±30 BPM
-        low_hz    = max(
-            self.hr_estimate_hz - margin_hz,
-            0.667  # absolute minimum 40 BPM
-        )
-        high_hz   = min(
-            self.hr_estimate_hz + margin_hz,
-            3.0    # absolute maximum 180 BPM
-        )
+        margin_hz = 30.0 / 60.0
+        low_hz    = max(self.hr_estimate_hz - margin_hz, 0.667)
+        high_hz   = min(self.hr_estimate_hz + margin_hz, 3.0)
         return low_hz, high_hz
 
     def get_rr_tolerance(self, signal_quality=None):
-        """
-        Dynamic RR filter tolerance for Step 8.
-
-        Tightens when signal is clean, relaxes when noisy.
-        Prevents the filter from discarding real beats
-        during natural HR variation on noisy signals.
-
-        Input:
-            signal_quality — float 0.0–1.0 from Step 11
-                             None → returns 0.40 default
-
-        Output:
-            tolerance — fraction of median RR
-                        (0.30 clean → 0.50 noisy)
-        """
         if signal_quality is None:
             return 0.40
-
-        # Clean signal (quality > 0.7): tighter filter
-        # Noisy signal (quality < 0.3): looser filter
         tolerance = 0.30 + (1.0 - signal_quality) * 0.20
-        return round(float(np.clip(tolerance,
-                                   0.30, 0.50)), 3)
-    
+        return round(float(np.clip(tolerance, 0.30, 0.50)), 3)
 
     def get_std_floor(self):
-        """
-        Personal HRV reliability floor for Step 11.
-        Derived as 20% of the patient's personal
-        amplitude_target — already correctly scaled
-        to the filtered signal domain.
-        Falls back to 0.002 if calibration failed.
-        """
         if self.amplitude_target is not None:
-            return max(
-                self.amplitude_target * 0.10,
-                0.0002
-            )
+            return max(self.amplitude_target * 0.10, 0.0002)
         return 0.002
 
     def get_clip_multiplier(self):
-        """
-        Personal artifact clipping multiplier for Step 6.
-
-        Fixed 4.0 is too tight for patients with naturally
-        high signal variance (strong pulse) and too loose
-        for patients with weak signal.
-
-        Derived from calibration:
-            - Low baseline_g_std (weak signal) → tighter
-            clip (3.0) — artifacts stand out more
-            - High baseline_g_std (strong signal) → looser
-            clip (5.0) — more natural variance to preserve
-
-        Range: 3.0 – 5.0
-        Falls back to 4.0 if calibration failed.
-        """
         if self.baseline_g_std is None:
             return 4.0
-        # Scale: std=0.3 → 3.0, std=1.0 → 4.0, std=2.0+ → 5.0
         multiplier = 3.0 + (self.baseline_g_std / 2.0)
         return round(float(np.clip(multiplier, 3.0, 5.0)), 2)
-    
 
     def calibrate_scale_factor(self, g_samples, fps):
-        """
-        Measure the actual ratio between raw green std
-        and filtered pulse std for THIS patient on THIS
-        device under THIS lighting.
-        
-        Replaces the hardcoded 0.004 with a measured value.
-        """
         try:
             from scipy.signal import butter, filtfilt
-            
-            g = np.array(g_samples, dtype=float)
-            g_norm = g - np.mean(g)
-            
-            raw_std = float(np.std(g_norm))
+
+            g        = np.array(g_samples, dtype=float)
+            g_norm   = g - np.mean(g)
+            raw_std  = float(np.std(g_norm))
+
             if raw_std < 1e-10:
-                return 0.004  # flat signal, use default
-            
-            # Quick bandpass identical to Step 6
-            nyq  = fps / 2.0
-            low  = np.clip(0.667 / nyq, 0.001, 0.999)
-            high = np.clip(3.0   / nyq, 0.001, 0.999)
-            b, a = butter(4, [low, high], btype='band')
+                return 0.004
+
+            nyq      = fps / 2.0
+            low      = np.clip(0.667 / nyq, 0.001, 0.999)
+            high     = np.clip(3.0   / nyq, 0.001, 0.999)
+            b, a     = butter(4, [low, high], btype='band')
             filtered = filtfilt(b, a, g_norm)
-            
+
             filtered_std = float(np.std(filtered))
             if filtered_std < 1e-10:
                 return 0.004
-            
+
             scale = filtered_std / raw_std
-            # Clamp to plausible range — sanity check
             return float(np.clip(scale, 0.001, 0.015))
-        
+
         except Exception:
-            return 0.004  # fallback if anything fails
-    
+            return 0.004
+
     # ─────────────────────────────────────
     # Reporting
     # ─────────────────────────────────────
 
     def print_profile(self):
-        """Print calibration profile to terminal."""
         print(f"\n{'─'*45}")
         print(f"SUBJECT PROFILE (calibration results)")
         print(f"{'─'*45}")
@@ -421,16 +427,16 @@ class SubjectProfile:
               f"({self.fitzpatrick})")
         print(f"  Calibration frames:{self.n_calibration_frames}")
         print(f"  Valid:             {self.is_valid}")
+        if self.validation_reason:
+            print(f"  ⚠ Reason:         {self.validation_reason}")
         if self.baseline_g_mean is not None:
             print(f"  Green baseline:    "
                   f"mean={self.baseline_g_mean:.2f}  "
                   f"std={self.baseline_g_std:.4f}")
             print(f"  Motion threshold:  "
-                  f"{self.motion_threshold:.4f}  "
-                  f"(3× personal noise floor)")
+                  f"{self.motion_threshold:.4f}")
             print(f"  Amplitude target:  "
-                  f"{self.amplitude_target:.6f}  "
-                  f"(80% of personal best)")
+                  f"{self.amplitude_target:.6f}")
         if self.hr_estimate_bpm is not None:
             print(f"  HR estimate:       "
                   f"{self.hr_estimate_bpm:.1f} BPM  "
