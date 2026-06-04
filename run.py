@@ -77,6 +77,38 @@ from step11_signal_quality_score.step11_snr import (
 
 
 # ─────────────────────────────────────────
+# Failure exit helper
+# ─────────────────────────────────────────
+
+def measurement_failed(cap, reason, suggestions=None):
+    """
+    Clean exit when measurement cannot be completed.
+
+    Prints a clear, actionable failure message and
+    exits with code 0 (not an error — expected outcome
+    when conditions are insufficient).
+
+    Input:
+        cap         — VideoCapture to release
+        reason      — string: what failed
+        suggestions — list of strings: what to fix
+    """
+    print(f"\n{'='*50}")
+    print("MEASUREMENT FAILED")
+    print(f"{'='*50}")
+    print(f"\n{reason}")
+
+    if suggestions:
+        print("\nTo fix this:")
+        for s in suggestions:
+            print(f"  • {s}")
+
+    print(f"\n{'='*50}")
+    cap.release()
+    sys.exit(0)
+
+
+# ─────────────────────────────────────────
 # Adaptive cutoff helper
 # ─────────────────────────────────────────
 
@@ -98,18 +130,14 @@ def get_adaptive_low_hz(rr_valid, rr_hz, rr_confidence):
 # ─────────────────────────────────────────
 # Steps 4–11 runner
 # ─────────────────────────────────────────
-# Extracted into a function so the face and palm
-# branches share identical processing logic.
-# No code duplication — one path for both modalities.
 
 def run_steps_4_to_11(r, g, b, fps_measured,
                        quality_ok, profile, modality):
     """
     Run Steps 4–11 on a raw RGB signal.
 
-    Used by both the face branch and the palm branch.
-    Steps 4–11 are signal-agnostic — they don't care
-    whether the RGB came from face or palm.
+    Used by both face and palm branches.
+    Steps 4–11 are signal-agnostic.
 
     Input:
         r, g, b      — raw signal arrays from Step 3
@@ -119,13 +147,13 @@ def run_steps_4_to_11(r, g, b, fps_measured,
         modality     — "face" or "palm" (for labels)
 
     Output:
-        hr_results   — dict from compute_hr_hrv
-        rr_bpm       — respiratory rate BPM
-        snr_score    — float 0–1
-        snr_db       — float dB
-        route_palm   — bool routing decision
+        hr_results    — dict from compute_hr_hrv
+        rr_bpm        — respiratory rate BPM
+        snr_score     — float 0–1
+        snr_db        — float dB
+        route_palm    — bool routing decision
         quality_level — "high" / "medium" / "low"
-        snr_report   — dict with routing details
+        snr_report    — dict with routing details
     """
 
     # ── Step 4 ────────────────────────────────────
@@ -227,8 +255,6 @@ def run_steps_4_to_11(r, g, b, fps_measured,
     n_peaks, n_harmonics = \
         find_dominant_peak(freqs, power)
 
-    # FFT cross-check: override sub-harmonic if Step 7
-    # found a higher-confidence peak
     fft_dominant_bpm = fft_report.get('peak_bpm', None)
     if fft_dominant_bpm is not None and \
        hr_bpm is not None and \
@@ -240,7 +266,6 @@ def run_steps_4_to_11(r, g, b, fps_measured,
             hr_bpm  = fft_dominant_bpm
             peak_hz = fft_dominant_bpm / 60.0
 
-    # First pass — signal_quality unknown yet
     peak_indices, peak_times, rr_intervals, rr_tolerance = \
         detect_beat_peaks(
             filtered, fps_measured,
@@ -256,7 +281,7 @@ def run_steps_4_to_11(r, g, b, fps_measured,
         rr_tolerance = rr_tolerance
     )
 
-    # ── Step 9 — first pass (feeds confidence to Step 11)
+    # ── Step 9 — first pass ───────────────────────
     print("\n" + "="*50)
     print(f"STEP 9 — Heart rate & HRV ({modality})")
     print("="*50)
@@ -282,7 +307,9 @@ def run_steps_4_to_11(r, g, b, fps_measured,
             filtered, freqs, power,
             hr_bpm, rr_intervals, fps_measured,
             hr_confidence = hr_results_pass1['confidence'],
-            profile       = profile
+            profile       = profile,
+            hr_reliable   = hr_results_pass1.get(
+                                'hr_reliable', True)
         )
 
     print_snr_report(
@@ -290,7 +317,7 @@ def run_steps_4_to_11(r, g, b, fps_measured,
         route_palm, quality_level, snr_report
     )
 
-    # ── Step 8 — second pass (signal_quality known) ───
+    # ── Step 8 — second pass ──────────────────────
     print(f"\nStep 8 second pass — "
           f"refining RR filter with quality={snr_score:.3f}")
 
@@ -302,7 +329,7 @@ def run_steps_4_to_11(r, g, b, fps_measured,
             signal_quality = snr_score
         )
 
-    # ── Step 9 — final pass (refined RR intervals) ────
+    # ── Step 9 — final pass ───────────────────────
     hr_results = compute_hr_hrv(
         hr_bpm_fft   = hr_bpm,
         rr_intervals = rr_intervals,
@@ -324,6 +351,27 @@ def run_steps_4_to_11(r, g, b, fps_measured,
         quality_level,
         snr_report
     )
+
+
+# ─────────────────────────────────────────
+# Summary printer helper
+# ─────────────────────────────────────────
+
+def print_rmssd_lines(hr_results, snr_report):
+    """Print RMSSD and HRV lines for final summary."""
+    if hr_results['hrv_available']:
+        rmssd_line = f"{hr_results['rmssd']} ms" \
+                     if hr_results['rmssd'] is not None \
+                     else "Insufficient beats"
+        if snr_report.get('std_floor_triggered'):
+            rmssd_line += "  ⚠ LOW CONFIDENCE"
+        if hr_results['hrv_confidence'] == "low":
+            rmssd_line += "  ⚠ LOW CONFIDENCE (60fps)"
+        print(f"RMSSD:         {rmssd_line}")
+        print(f"HRV:           {hr_results['hrv_overall']}")
+    else:
+        print(f"RMSSD:         ✗ Not reported")
+        print(f"HRV:           {hr_results['hrv_fps_message']}")
 
 
 # ─────────────────────────────────────────
@@ -355,9 +403,16 @@ if __name__ == "__main__":
     )
 
     if face_state.combined_mask is None:
-        print("ERROR: No face ROI detected")
-        cap.release()
-        sys.exit(1)
+        measurement_failed(
+            cap,
+            reason="Face not detected during setup.",
+            suggestions=[
+                "Ensure your face is centered and fully visible",
+                "Move closer to the camera",
+                "Improve lighting — avoid strong backlight",
+                "Remove glasses or objects blocking your face",
+            ]
+        )
 
     # ── Step 3 — Face RGB signal ───────────────────
     print("\n" + "="*50)
@@ -395,24 +450,19 @@ if __name__ == "__main__":
     print(f"FACE MEASUREMENT COMPLETE — Steps 1–11")
     print(f"{'='*50}")
     print(f"Modality:      FACE")
-    print(f"Heart Rate:    {hr_results['final_hr']} BPM")
+    hr_flag = ""
+    if not hr_results.get('hr_reliable', True):
+        hr_flag = (
+            f"  ⚠ LOW CONFIDENCE "
+            f"(FFT/RR disagreement "
+            f"±{hr_results['hr_agreement']} BPM)"
+        )
+    print(f"Heart Rate:    {hr_results['final_hr']} BPM"
+          f"{hr_flag}")
     print(f"Respiratory:   "
           f"{rr_bpm if rr_bpm else 'N/A'} BrPM")
-    if hr_results['hrv_available']:
-        rmssd_line = f"{hr_results['rmssd']} ms" \
-                     if hr_results['rmssd'] is not None \
-                     else "Insufficient beats"
-        if snr_report.get('std_floor_triggered'):
-            rmssd_line += "  ⚠ LOW CONFIDENCE"
-        if hr_results['hrv_confidence'] == "low":
-            rmssd_line += "  ⚠ LOW CONFIDENCE (60fps)"
-        print(f"RMSSD:         {rmssd_line}")
-        print(f"HRV:           {hr_results['hrv_overall']}")
-    else:
-        print(f"RMSSD:         ✗ Not reported "
-              f"({hr_results['hrv_fps_message']})")
-        print(f"HRV:           Requires 60fps+ camera")    
-        print(f"SNR Score:     {snr_score:.4f} "
+    print_rmssd_lines(hr_results, snr_report)
+    print(f"SNR Score:     {snr_score:.4f} "
           f"({quality_level.upper()})")
     print(f"Routing:       "
           f"{'⚠ PALM RECOMMENDED' if route_palm else '✓ FACE ACCEPTED'}"
@@ -453,14 +503,28 @@ if __name__ == "__main__":
         palm_state   = PalmROIState()
         palm_profile = run_palm_roi_extraction(
             cap, actual_fps, palm_state,
-            duration_sec=10           # 5s mask + 5s calibration
+            duration_sec=10
         )
 
+        # Palm mask failure — patient never showed palm
         if palm_state.combined_mask is None:
-            print("ERROR: No palm ROI detected. "
-                  "Please ensure your palm is visible.")
-            cap.release()
-            sys.exit(1)
+            measurement_failed(
+                cap,
+                reason=(
+                    "Palm not detected during setup. "
+                    "The system could not establish a "
+                    "measurement region on your palm."
+                ),
+                suggestions=[
+                    "Hold your palm open and flat, "
+                    "facing the camera",
+                    "Keep your hand centered in the frame",
+                    "Ensure your palm is well-lit — "
+                    "avoid shadows across your hand",
+                    "Move your hand closer to the camera",
+                    "Try your other hand if the problem persists",
+                ]
+            )
 
         # ── Step 3b — Palm RGB signal ──────────────
         print("\n" + "="*50)
@@ -479,13 +543,13 @@ if __name__ == "__main__":
             for issue in issues:
                 print(f"  - {issue}")
 
-        # ── Steps 4–11 (palm) — identical processing ──
+        # ── Steps 4–11 (palm) ─────────────────────
         (
             hr_results,
             rr_bpm,
             snr_score,
             snr_db,
-            route_palm_again,   # should be False now
+            route_palm_again,
             quality_level,
             snr_report
         ) = run_steps_4_to_11(
@@ -493,32 +557,47 @@ if __name__ == "__main__":
             quality_ok, palm_profile, modality="palm"
         )
 
+        # ── Palm also failed — hard stop ───────────
+        if route_palm_again:
+            measurement_failed(
+                cap,
+                reason=(
+                    "Both face and palm signals are too weak "
+                    "for a reliable measurement. "
+                    f"Palm SNR score: {snr_score:.3f} "
+                    f"(need ≥ 0.45)."
+                ),
+                suggestions=[
+                    "Improve lighting — move closer to a lamp "
+                    "or face a window",
+                    "Ensure your palm is flat, centered, "
+                    "and fully visible",
+                    "Avoid strong backlight behind you",
+                    "Clean the camera lens if it appears foggy",
+                    "Try again in a brighter room",
+                ]
+            )
+
         # ── Palm final summary ─────────────────────
         print(f"\n{'='*50}")
         print(f"PALM MEASUREMENT COMPLETE — Steps 1–11")
         print(f"{'='*50}")
         print(f"Modality:      PALM")
-        print(f"Heart Rate:    {hr_results['final_hr']} BPM")
+        hr_flag = ""
+        if not hr_results.get('hr_reliable', True):
+            hr_flag = (
+                f"  ⚠ LOW CONFIDENCE "
+                f"(FFT/RR disagreement "
+                f"±{hr_results['hr_agreement']} BPM)"
+            )
+        print(f"Heart Rate:    {hr_results['final_hr']} BPM"
+            f"{hr_flag}")
         print(f"Respiratory:   "
               f"{rr_bpm if rr_bpm else 'N/A'} BrPM")
-        if hr_results['hrv_available']:
-            rmssd_line = f"{hr_results['rmssd']} ms" \
-                        if hr_results['rmssd'] is not None \
-                        else "Insufficient beats"
-            if snr_report.get('std_floor_triggered'):
-                rmssd_line += "  ⚠ LOW CONFIDENCE"
-            if hr_results['hrv_confidence'] == "low":
-                rmssd_line += "  ⚠ LOW CONFIDENCE (60fps)"
-            print(f"RMSSD:         {rmssd_line}")
-            print(f"HRV:           {hr_results['hrv_overall']}")
-        else:
-            print(f"RMSSD:         ✗ Not reported "
-                f"({hr_results['hrv_fps_message']})")
-            print(f"HRV:           Requires 60fps+ camera")
+        print_rmssd_lines(hr_results, snr_report)
         print(f"SNR Score:     {snr_score:.4f} "
               f"({quality_level.upper()})")
-        print(f"Routing:       "
-              f"{'⚠ STILL WEAK — check lighting' if route_palm_again else '✓ PALM ACCEPTED'}")
+        print(f"Routing:       ✓ PALM ACCEPTED")
         print(f"Confidence:    "
               f"{hr_results['confidence']} "
               f"({hr_results['confidence_level'].upper()})")
@@ -528,15 +607,8 @@ if __name__ == "__main__":
               f"(was: {profile.fitzpatrick})")
         print(f"Profile valid: {palm_profile.is_valid}")
         if palm_profile.hr_estimate_bpm:
-            print(f"Calib HR est:  {palm_profile.hr_estimate_bpm} BPM")
-
-        if route_palm_again:
-            print(
-                "\n⚠ Palm signal also weak. "
-                "Suggestions: improve lighting, "
-                "move closer to camera, "
-                "ensure palm is flat and centered."
-            )
+            print(f"Calib HR est:  "
+                  f"{palm_profile.hr_estimate_bpm} BPM")
 
     print(f"\nReady for Step 12 (display)")
     cap.release()

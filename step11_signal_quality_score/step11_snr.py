@@ -202,7 +202,8 @@ def compute_amplitude_score(filtered, profile=None):
 def compute_snr_score(filtered, freqs, power,
                        hr_bpm, rr_intervals, fps,
                        hr_confidence=None,
-                       profile=None):
+                       profile=None,
+                       hr_reliable=True):
     """
     Compute final SNR score and routing decision.
 
@@ -248,6 +249,14 @@ def compute_snr_score(filtered, freqs, power,
         )
     else:
         confidence_score = 0.5
+
+    # Apply penalty when FFT and RR disagree.
+    # Reduces confidence score by 25% so borderline
+    # cases tip toward palm routing.
+    if not hr_reliable:
+        confidence_score = round(
+            confidence_score * 0.75, 4
+        )
 
     snr_score = (
         spectral_score   * 0.30 +
@@ -315,6 +324,7 @@ def compute_snr_score(filtered, freqs, power,
         'threshold_source':     thresh_source,
         'std_floor_triggered':  std_floor_triggered,
         'std_floor_value':      std_floor,
+        'hr_reliable':          hr_reliable,
     }
 
     return (

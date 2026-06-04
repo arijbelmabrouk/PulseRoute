@@ -394,12 +394,15 @@ def compute_hr_hrv(hr_bpm_fft, rr_intervals,
         snr_ratio, n_beats, quality_ok
     )
 
+    hr_reliable = (hr_source == 'combined')
+
     results = {
         'final_hr':          final_hr,
         'hr_bpm_fft':        round(hr_bpm_fft, 1),
         'hr_rr_mean':        hr_rr_mean,
         'hr_source':         hr_source,
         'hr_agreement':      agreement,
+        'hr_reliable':       hr_reliable,
         'rmssd':             rmssd,
         'sdnn':              sdnn,
         'n_beats':           n_beats,
