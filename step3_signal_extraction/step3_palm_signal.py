@@ -383,8 +383,20 @@ def run_palm_signal_extraction(cap, actual_fps, state,
             profile      = profile
         )
     finally:
-        # Always close MediaPipe even if extraction fails
         hands_context.__exit__(None, None, None)
+
+    # FPS drop check — MediaPipe overhead can reduce fps
+    # on slower machines. If measured fps dropped more than
+    # 30% below calibration fps, warn that HR timing
+    # may be less reliable.
+    measured_fps = result[3]  # fps_measured is index 3
+    if measured_fps < actual_fps * 0.70:
+        print(f"\n⚠ FPS drop detected during palm recording:")
+        print(f"  Calibration fps: {actual_fps:.1f}")
+        print(f"  Recording fps:   {measured_fps:.1f}")
+        print(f"  Drop: {((actual_fps - measured_fps)/actual_fps)*100:.0f}%")
+        print(f"  HR timing may be slightly less reliable.")
+        print(f"  If this persists, close other applications.")
 
     return result
 

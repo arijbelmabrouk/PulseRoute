@@ -458,6 +458,7 @@ def run_signal_extraction(cap, actual_fps,
         print(f"Motion rejection: OFF  (no profile)")
     print("Press Q to stop early")
 
+    consecutive_failures = 0
     while not buffer.is_full():
         # Hard wall-clock cap
         if time.time() > wall_deadline:
@@ -468,7 +469,13 @@ def run_signal_extraction(cap, actual_fps,
 
         ret, frame = cap.read()
         if not ret:
-            break
+            consecutive_failures += 1
+            if consecutive_failures >= 30:
+                print(f"\n⚠ Camera disconnected — "
+                      f"30 consecutive read failures.")
+                break
+            continue
+        consecutive_failures = 0
 
         frame_rgb = cv2.cvtColor(
             frame, cv2.COLOR_BGR2RGB
