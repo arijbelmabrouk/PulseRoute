@@ -325,7 +325,9 @@ class SubjectProfile:
 
     def _ita_to_fitzpatrick(self, ita):
         if ita > 55:
-            return "FST I-II"
+            return "FST I"
+        elif ita > 41:
+            return "FST II"
         elif ita > 28:
             return "FST III"
         elif ita > 10:

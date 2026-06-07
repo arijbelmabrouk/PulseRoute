@@ -329,10 +329,14 @@ def run_palm_signal_extraction(cap, actual_fps, state,
         Returns (combined, thenar, central) tuple.
         """
         frame_counter[0] += 1
+        # Only run MediaPipe every 3rd frame — reduces CPU load
+        # while keeping mask tracking responsive enough
+        if frame_counter[0] % 3 == 0:
+            results = hands_context.process(frame_rgb)
+        else:
+            results = None
 
-        results = hands_context.process(frame_rgb)
-
-        if results.multi_hand_landmarks:
+        if results is not None and results.multi_hand_landmarks:
             landmarks  = results.multi_hand_landmarks[0].landmark
             handedness = results.multi_handedness[0]
 

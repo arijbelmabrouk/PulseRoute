@@ -112,8 +112,7 @@ def get_hrv_fps_status(fps):
             False,
             "suppressed",
             f"HRV requires 60fps+ camera "
-            f"(current: {fps:.0f}fps — "
-            f"beat timing too coarse at 30fps)"
+            f"(current: {fps:.0f}fps)"
         )
     elif fps < HRV_FPS_FULL:
         return (
@@ -438,12 +437,14 @@ def print_hr_hrv_report(results):
     if results['hr_agreement']:
         print(f"  Agreement:     ±{results['hr_agreement']} BPM")
 
-    print(f"\nHRV ({results['hrv_fps_message']}):")
-    print(f"  Age group:     {results['age_group']}")
-    print(f"  Beats used:    {results['n_beats']}")
-    print(f"  RR intervals:  {results['n_rr']}")
-
+    # --- FIX 1: Clean Section Header ---
+    print(f"\nHRV:") 
+    
     if results['hrv_available']:
+        print(f"  Age group:     {results['age_group']}")
+        print(f"  Beats used:    {results['n_beats']}")
+        print(f"  RR intervals:  {results['n_rr']}")
+
         if results['rmssd'] is not None:
             print(f"  RMSSD:         {results['rmssd']} ms"
                   f"  ← {results['rmssd_interp']}")
@@ -460,12 +461,15 @@ def print_hr_hrv_report(results):
         print(f"\nHRV Overall:   {results['hrv_overall']}")
         if results['age_group'] != "N/A":
             print(f"  (norms: {results['age_group']})")
+            
     else:
-        # fps too low — show clear message, no numbers
+        # --- FIX 2: Fixed formatting & closed parenthesis for low FPS ---
         print(f"  RMSSD:         ✗ Not reported")
         print(f"  SDNN:          ✗ Not reported")
+        
+        # Ensures 'hrv_overall' shows a clean label, with the message cleanly wrapped below it
         print(f"\nHRV Overall:   {results['hrv_overall']}")
-        print(f"  → {results['hrv_fps_message']}")
+        print(f"  Status:        ({results['hrv_fps_message']})")
 
     print(f"\nConfidence score: {results['confidence']}")
     print(f"  (passed to Step 11 for routing decision)")
