@@ -1,10 +1,41 @@
 import { useWebSocket } from '../hooks/useWebSocket'
+import { useEffect, useState } from 'react'
 
-const STEPS = [
-  { id: 1,  label: 'Camera ready' },
-  { id: 2,  label: 'Face detected & calibrated' },
+const C = {
+  blue:      '#1a5dab',
+  blueLight: '#e8f1fb',
+  blueMid:   '#2d79d6',
+  navy:      '#1a2b4a',
+  bodyText:  '#3d4f6b',
+  muted:     '#6b7a91',
+  border:    '#dce4ef',
+  borderLt:  '#edf2f8',
+  bg:        '#f5f7fa',
+  white:     '#ffffff',
+  green:     '#1a9e6e',
+  greenBg:   '#eaf7f1',
+  amber:     '#c47a10',
+  amberBg:   '#fdf3e1',
+  rose:      '#c0392b',
+  roseBg:    '#fcecea',
+  sans:      "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+}
+
+const STEPS_FACE = [
+  { id: 1,  label: 'Camera initialised' },
+  { id: 2,  label: 'Face detected and calibrated' },
   { id: 3,  label: 'Signal captured' },
-  { id: 5,  label: 'Pulse extracted' },
+  { id: 5,  label: 'Pulse waveform extracted' },
+  { id: 6,  label: 'Signal filtered' },
+  { id: 7,  label: 'Frequency analysis' },
+  { id: 9,  label: 'Heart rate computed' },
+  { id: 10, label: 'Respiratory rate computed' },
+  { id: 11, label: 'Quality assessment' },
+]
+const STEPS_PALM = [
+  { id: 2,  label: 'Palm detected and calibrated' },
+  { id: 3,  label: 'Palm signal captured' },
+  { id: 5,  label: 'Pulse waveform extracted' },
   { id: 6,  label: 'Signal filtered' },
   { id: 7,  label: 'Frequency analysis' },
   { id: 9,  label: 'Heart rate computed' },
@@ -12,267 +43,353 @@ const STEPS = [
   { id: 11, label: 'Quality assessment' },
 ]
 
-function ProgressRing({ pct }) {
-  const r = 54, circ = 2 * Math.PI * r
-  const offset = circ - (pct / 100) * circ
+function ArcRing({ pct, failed, complete }) {
+  const size = 160, cx = 80, cy = 80, r = 66, sw = 5
+  const toRad = d => (d * Math.PI) / 180
+  const polar = (a, rd) => ({ x: cx + rd * Math.cos(toRad(a)), y: cy + rd * Math.sin(toRad(a)) })
+  const arcPath = (sa, ea, rd) => {
+    const s = polar(sa, rd), e = polar(ea, rd)
+    const large = (ea - sa) > 180 ? 1 : 0
+    return `M ${s.x} ${s.y} A ${rd} ${rd} 0 ${large} 1 ${e.x} ${e.y}`
+  }
+  const startDeg = -220, totalArc = 280
+  const endDeg   = startDeg + (pct / 100) * totalArc
+  const trackEnd = startDeg + totalArc
+  const fillColor = failed ? C.rose : complete ? C.green : C.blue
+
   return (
-    <svg width="128" height="128" viewBox="0 0 128 128">
-      <circle cx="64" cy="64" r={r}
-        fill="none" stroke="#e5e7eb" strokeWidth="6" />
-      <circle cx="64" cy="64" r={r}
-        fill="none" stroke="#1a56db" strokeWidth="6"
-        strokeDasharray={circ} strokeDashoffset={offset}
-        strokeLinecap="round"
-        transform="rotate(-90 64 64)"
-        style={{ transition: 'stroke-dashoffset 0.6s ease' }}
-      />
-      <text x="64" y="60" textAnchor="middle"
-        fontSize="22" fontWeight="600" fill="#0f1923"
-        fontFamily="Inter, sans-serif">
-        {pct}%
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      <path d={arcPath(startDeg, trackEnd, r)} fill="none"
+        stroke={C.borderLt} strokeWidth={sw} strokeLinecap="round" />
+      <path d={arcPath(startDeg, Math.max(startDeg + 0.5, endDeg), r)}
+        fill="none" stroke={fillColor} strokeWidth={sw} strokeLinecap="round"
+        style={{ transition: 'all 0.6s ease' }} />
+      <text x={cx} y={cy - 6} textAnchor="middle"
+        fontSize="26" fontWeight="700" fill={failed ? C.rose : complete ? C.green : C.navy}
+        fontFamily="Inter, sans-serif" letterSpacing="-1">
+        {failed ? '—' : `${pct}`}
       </text>
-      <text x="64" y="76" textAnchor="middle"
-        fontSize="11" fill="#8a95a3"
-        fontFamily="Inter, sans-serif">
-        complete
+      <text x={cx} y={cy + 14} textAnchor="middle"
+        fontSize="10" fill={C.muted}
+        fontFamily="Inter, sans-serif" letterSpacing="1">
+        {failed ? 'FAILED' : complete ? 'DONE' : 'PROGRESS'}
       </text>
     </svg>
   )
 }
 
-export default function PatientPage() {
-  const { state, connected } = useWebSocket('/ws/patient')
-  const isIdle     = state.status === 'idle'
-  const isRunning  = state.status === 'running' || state.status === 'starting'
-  const isComplete = state.status === 'complete'
-  const final      = state.final || {}
-  const pct        = state.progress || 0
-  const doneSteps  = Object.keys(state.steps || {}).map(Number)
+function StepRow({ label, done, active }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 12,
+      padding: '9px 0',
+      borderBottom: `1px solid ${C.borderLt}`,
+      opacity: done || active ? 1 : 0.4,
+      transition: 'opacity 0.35s',
+    }}>
+      <div style={{
+        width: 22, height: 22, borderRadius: 6, flexShrink: 0,
+        background: done ? C.blue : active ? C.blueLight : C.bg,
+        border: `1.5px solid ${done ? C.blue : active ? C.blue : C.border}`,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        transition: 'all 0.3s',
+      }}>
+        {done && (
+          <svg width="10" height="8" viewBox="0 0 10 8" fill="none">
+            <path d="M1 4l3 3 5-6" stroke={C.white} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        )}
+        {active && !done && (
+          <div style={{
+            width: 7, height: 7, borderRadius: '50%', background: C.blue,
+            animation: 'blink 1.2s infinite',
+          }} />
+        )}
+      </div>
+      <span style={{
+        fontSize: 13, fontFamily: C.sans,
+        color: done ? C.navy : active ? C.blue : C.muted,
+        fontWeight: done ? 500 : 400,
+        transition: 'color 0.3s',
+      }}>{label}</span>
+      {done && (
+        <span style={{
+          marginLeft: 'auto', fontSize: 10, fontWeight: 600,
+          color: C.green, letterSpacing: '0.05em', textTransform: 'uppercase',
+        }}>Done</span>
+      )}
+    </div>
+  )
+}
+
+function ResultCard({ label, value, unit, accent }) {
+  const [shown, setShown] = useState(false)
+  useEffect(() => { if (value) setTimeout(() => setShown(true), 100) }, [!!value])
 
   return (
     <div style={{
-      minHeight: '100vh', background: 'var(--bg)',
+      background: accent ? C.blueLight : C.bg,
+      border: `1px solid ${accent ? C.blue + '44' : C.border}`,
+      borderRadius: 12, padding: '1.25rem',
+      textAlign: 'center',
+      opacity: shown ? 1 : 0,
+      transform: shown ? 'translateY(0)' : 'translateY(8px)',
+      transition: 'opacity 0.45s ease, transform 0.45s ease',
+    }}>
+      <div style={{
+        fontSize: '2.2rem', fontWeight: 700,
+        color: accent ? C.blue : C.navy, lineHeight: 1,
+        letterSpacing: '-0.03em', fontFamily: C.sans,
+      }}>{value}</div>
+      <div style={{
+        fontSize: 11, fontWeight: 600, letterSpacing: '0.07em',
+        textTransform: 'uppercase', color: C.muted, marginTop: 6,
+        fontFamily: C.sans,
+      }}>{label} · {unit}</div>
+    </div>
+  )
+}
+
+export default function PatientPage() {
+  const { state, connected } = useWebSocket('/ws/patient')
+
+  const isFailed   = state.status === 'failed'
+  const isIdle     = state.status === 'idle'
+  const isRunning  = state.status === 'running' || state.status === 'starting'
+  const isComplete = state.status === 'complete'
+  const isPalm     = state.modality === 'palm' || state.mode === 'palm'
+  const isRouting  = isRunning && state.route_palm === true
+
+  const final     = state.final || {}
+  const pct       = state.progress || 0
+  const doneSteps = Object.keys(state.steps || {}).map(Number)
+  const STEPS     = isPalm ? STEPS_PALM : STEPS_FACE
+
+  const instruction = isPalm
+    ? 'Hold your palm flat and open, centered in front of the camera'
+    : 'Look directly at the camera and remain still'
+
+  const statusLabel = isFailed ? 'Measurement failed'
+    : isComplete ? 'Measurement complete'
+    : isRunning  ? 'Measuring your vitals'
+    : 'Waiting for your doctor to start'
+
+  const statusColor = isFailed ? C.rose
+    : isComplete ? C.green
+    : isRunning  ? C.blue
+    : C.muted
+
+  return (
+    <div style={{
+      minHeight: '100vh', background: C.bg,
+      fontFamily: C.sans, color: C.navy,
       display: 'flex', flexDirection: 'column',
-      alignItems: 'center', justifyContent: 'center',
-      padding: '2rem',
     }}>
 
-      {/* Header */}
-      <div style={{ textAlign: 'center', marginBottom: '2.5rem' }}>
-        <div style={{
-          display: 'inline-flex', alignItems: 'center', gap: '8px',
-          background: 'var(--surface)', border: '1px solid var(--border)',
-          borderRadius: '999px', padding: '5px 14px',
-          fontSize: '12px', color: 'var(--text2)',
-          marginBottom: '1rem', boxShadow: 'var(--shadow-sm)',
-        }}>
-          <span className={connected ? 'blink' : ''} style={{
-            width: 7, height: 7, borderRadius: '50%',
-            background: connected ? 'var(--success)' : '#d1d5db',
-            display: 'inline-block', flexShrink: 0,
-          }} />
-          {connected ? 'Connected to measurement system' : 'Connecting…'}
+      {/* ── Nav ── */}
+      <nav style={{
+        background: C.white, borderBottom: `1px solid ${C.border}`,
+        padding: '0 2rem', height: 56,
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{
+            width: 30, height: 30, borderRadius: '50%',
+            border: `2.5px solid ${C.blue}`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <div style={{ width: 14, height: 14, borderRadius: '50%', border: `2px solid ${C.blue}` }} />
+          </div>
+          <span style={{ fontWeight: 700, fontSize: 15, color: C.navy }}>PulseRoute</span>
         </div>
-        <h1 style={{
-          fontSize: '1.75rem', fontWeight: 600,
-          color: 'var(--text)', letterSpacing: '-0.02em',
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          fontSize: 12, color: connected ? C.green : C.muted, fontWeight: 500,
         }}>
-          Contactless Vital Measurement
-        </h1>
-        <p style={{ color: 'var(--text2)', marginTop: '0.4rem', fontSize: '0.9rem' }}>
-          PulseRoute · Non-contact photoplethysmography
-        </p>
+          <span style={{
+            width: 6, height: 6, borderRadius: '50%',
+            background: connected ? C.green : C.muted,
+            animation: connected ? 'blink 2s infinite' : 'none',
+          }} />
+          {connected ? 'Connected' : 'Connecting…'}
+        </div>
+      </nav>
+
+      {/* Progress bar */}
+      <div style={{ height: 3, background: C.borderLt }}>
+        <div style={{
+          height: '100%', width: `${pct}%`,
+          background: isFailed ? C.rose : isComplete ? C.green : C.blue,
+          transition: 'width 0.5s ease', borderRadius: '0 3px 3px 0',
+        }} />
       </div>
 
-      {/* Main card */}
+      {/* ── Content ── */}
       <div style={{
-        width: '100%', maxWidth: 480,
-        background: 'var(--surface)',
-        border: '1px solid var(--border)',
-        borderRadius: 'var(--radius-lg)',
-        boxShadow: 'var(--shadow-md)',
-        overflow: 'hidden',
+        flex: 1, display: 'flex', alignItems: 'center',
+        justifyContent: 'center', padding: '2rem',
       }}>
+        <div style={{ width: '100%', maxWidth: 480 }}>
 
-        {/* Progress bar at top */}
-        <div style={{ height: 4, background: '#e5e7eb' }}>
+          {/* Header */}
+          <div style={{ textAlign: 'center', marginBottom: '1.5rem' }}>
+            <h1 style={{
+              fontSize: '1.4rem', fontWeight: 700, color: C.navy,
+              marginBottom: '0.3rem', letterSpacing: '-0.02em',
+            }}>Contactless Vital Measurement</h1>
+            <p style={{ fontSize: 13, color: C.muted }}>
+              PulseRoute · Remote photoplethysmography
+            </p>
+          </div>
+
+          {/* Main card */}
           <div style={{
-            height: '100%', width: `${pct}%`,
-            background: isComplete ? 'var(--success)' : 'var(--accent)',
-            transition: 'width 0.6s ease',
-          }} />
-        </div>
+            background: C.white,
+            border: `1px solid ${isFailed ? C.rose + '66' : C.border}`,
+            borderRadius: 16,
+            overflow: 'hidden',
+            transition: 'border-color 0.3s',
+          }}>
 
-        <div style={{ padding: '2rem' }}>
+            <div style={{ padding: '1.5rem' }}>
 
-          {/* Status + ring */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem', marginBottom: '1.5rem' }}>
-            <div style={{ position: 'relative', flexShrink: 0 }}>
-              {isRunning && (
-                <div className="pulse-ring" style={{
-                  position: 'absolute', inset: 0, borderRadius: '50%',
-                  border: '2px solid var(--accent)',
-                }} />
-              )}
-              <ProgressRing pct={pct} />
-            </div>
-            <div>
+              {/* Ring + status */}
               <div style={{
-                display: 'inline-flex', alignItems: 'center', gap: '6px',
-                padding: '3px 10px', borderRadius: 999, fontSize: '12px',
-                fontWeight: 500, marginBottom: '0.5rem',
-                ...(isComplete
-                  ? { background: 'var(--success-bg)', color: 'var(--success)' }
-                  : isRunning
-                    ? { background: 'var(--accent-bg)', color: 'var(--accent)' }
-                    : { background: 'var(--surface2)', color: 'var(--text3)' }),
+                display: 'flex', alignItems: 'center',
+                gap: '1.5rem', marginBottom: '1.25rem',
               }}>
-                <span style={{
-                  width: 6, height: 6, borderRadius: '50%', display: 'inline-block',
-                  background: isComplete ? 'var(--success)' : isRunning ? 'var(--accent)' : '#d1d5db',
-                  ...(isRunning ? {} : {}),
-                }} className={isRunning ? 'blink' : ''} />
-                {isComplete ? 'Measurement complete' : isRunning ? 'Measuring…' : 'Waiting to start'}
+                <div style={{ flexShrink: 0 }}>
+                  <ArcRing pct={pct} failed={isFailed} complete={isComplete} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 7,
+                    fontSize: 12, fontWeight: 600,
+                    padding: '5px 14px', borderRadius: 20, marginBottom: '0.6rem',
+                    background: isFailed ? C.roseBg : isComplete ? C.greenBg : isRunning ? C.blueLight : C.bg,
+                    color: statusColor,
+                    border: `1px solid ${statusColor}33`,
+                  }}>
+                    <span style={{
+                      width: 6, height: 6, borderRadius: '50%', background: statusColor,
+                      animation: isRunning ? 'blink 1.4s infinite' : 'none',
+                    }} />
+                    {statusLabel}
+                  </div>
+
+                  <p style={{
+                    fontSize: 13, color: C.muted, lineHeight: 1.6,
+                  }}>
+                    {isFailed
+                      ? (state.message || 'The signal was too weak for a reliable result.')
+                      : isRouting
+                        ? 'Switching to palm measurement for improved accuracy.'
+                        : isRunning
+                          ? instruction
+                          : isComplete
+                            ? 'Your doctor has received your results.'
+                            : 'Your doctor will start the measurement from their interface.'}
+                  </p>
+                </div>
               </div>
-              {state.message && (
-                <p style={{ fontSize: '0.85rem', color: 'var(--text2)', lineHeight: 1.4 }}>
-                  {state.message}
-                </p>
+
+              {/* Palm instruction */}
+              {isRouting && (
+                <div style={{
+                  padding: '12px 14px', borderRadius: 10, marginBottom: '1rem',
+                  background: C.amberBg, border: `1px solid ${C.amber}44`,
+                  fontSize: 13, color: C.amber, lineHeight: 1.6,
+                }}>
+                  Please hold the inside of your palm flat to the camera — open, centered, approximately 30 cm from the lens. Keep it still.
+                </div>
               )}
-              {isRunning && (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text3)', marginTop: '0.25rem' }}>
-                  Please look at the camera and stay still
-                </p>
+
+              {/* Motion warning */}
+              {isRunning && state.motion_pct > 20 && (
+                <div style={{
+                  padding: '10px 14px', borderRadius: 10, marginBottom: '1rem',
+                  background: C.amberBg, border: `1px solid ${C.amber}44`,
+                  fontSize: 13, color: C.amber,
+                }}>
+                  Movement detected — please hold still
+                </div>
+              )}
+
+              {/* Failed advice */}
+              {isFailed && (
+                <div style={{
+                  padding: '12px 14px', borderRadius: 10,
+                  background: C.roseBg, border: `1px solid ${C.rose}44`,
+                  fontSize: 13, color: C.rose, lineHeight: 1.6,
+                }}>
+                  Move closer to a light source and ensure your face is well-lit. Your doctor will start a new measurement.
+                </div>
+              )}
+
+              {/* Steps list */}
+              {(isRunning || isComplete) && (
+                <div style={{
+                  borderTop: `1px solid ${C.borderLt}`,
+                  paddingTop: '1rem', marginTop: '0.5rem',
+                }}>
+                  <p style={{
+                    fontSize: 11, fontWeight: 700, letterSpacing: '0.07em',
+                    textTransform: 'uppercase', color: C.muted, marginBottom: '0.75rem',
+                  }}>Measurement progress</p>
+                  {STEPS.map(({ id, label }, i) => {
+                    const done   = doneSteps.includes(id)
+                    const active = !done && isRunning && doneSteps.includes(STEPS[i - 1]?.id)
+                    return <StepRow key={id} label={label} done={done} active={active} />
+                  })}
+                </div>
+              )}
+
+              {/* Results */}
+              {isComplete && final.hr_bpm && (
+                <div style={{
+                  borderTop: `1px solid ${C.borderLt}`,
+                  paddingTop: '1rem', marginTop: '1rem',
+                }}>
+                  <p style={{
+                    fontSize: 11, fontWeight: 700, letterSpacing: '0.07em',
+                    textTransform: 'uppercase', color: C.muted, marginBottom: '0.75rem',
+                  }}>Your results</p>
+                  <div style={{
+                    display: 'grid', gridTemplateColumns: '1fr 1fr',
+                    gap: 10,
+                  }}>
+                    <ResultCard label="Heart rate" value={final.hr_bpm} unit="BPM" accent />
+                    {final.rr_bpm && <ResultCard label="Respiratory" value={final.rr_bpm} unit="BrPM" />}
+                  </div>
+                  {final.route_palm && (
+                    <div style={{
+                      marginTop: 10, padding: '9px 14px', borderRadius: 20,
+                      background: C.greenBg, border: `1px solid ${C.green}44`,
+                      fontSize: 12, color: C.green, fontWeight: 500,
+                      textAlign: 'center',
+                    }}>
+                      Measured via palm signal for improved accuracy
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           </div>
 
-          {/* Motion warning */}
-          {isRunning && state.motion_pct > 20 && (
-            <div className="fade-up" style={{
-              padding: '10px 14px', borderRadius: 'var(--radius-md)',
-              background: 'var(--warning-bg)',
-              border: '1px solid #fcd34d',
-              fontSize: '0.83rem', color: 'var(--warning)',
-              marginBottom: '1.2rem',
-              display: 'flex', alignItems: 'center', gap: '8px',
-            }}>
-              <span>⚠</span>
-              Movement detected — please hold still for accurate results
-            </div>
-          )}
-
-          {/* Step checklist */}
-          {(isRunning || isComplete) && (
-            <div style={{
-              borderTop: '1px solid var(--border)',
-              paddingTop: '1.2rem', marginBottom: '1.2rem',
-            }}>
-              <p style={{
-                fontSize: '11px', fontWeight: 500, color: 'var(--text3)',
-                letterSpacing: '0.08em', textTransform: 'uppercase',
-                marginBottom: '0.75rem',
-              }}>
-                Measurement steps
-              </p>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                {STEPS.map(({ id, label }) => {
-                  const done = doneSteps.includes(id)
-                  return (
-                    <div key={id} style={{
-                      display: 'flex', alignItems: 'center', gap: '10px',
-                      fontSize: '0.83rem',
-                      color: done ? 'var(--text)' : 'var(--text3)',
-                      transition: 'color 0.3s',
-                    }}>
-                      <div style={{
-                        width: 18, height: 18, borderRadius: '50%', flexShrink: 0,
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        fontSize: '10px',
-                        background: done ? 'var(--success-bg)' : 'var(--surface2)',
-                        border: `1px solid ${done ? '#6ee7b7' : 'var(--border)'}`,
-                        color: done ? 'var(--success)' : 'var(--text3)',
-                        transition: 'all 0.3s',
-                      }}>
-                        {done ? '✓' : ''}
-                      </div>
-                      {label}
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* Final results */}
-          {isComplete && final.hr_bpm && (
-            <div className="fade-up" style={{
-              borderTop: '1px solid var(--border)',
-              paddingTop: '1.2rem',
-            }}>
-              <p style={{
-                fontSize: '11px', fontWeight: 500, color: 'var(--text3)',
-                letterSpacing: '0.08em', textTransform: 'uppercase',
-                marginBottom: '1rem',
-              }}>
-                Your results
-              </p>
-              <div style={{
-                display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px',
-                marginBottom: '1rem',
-              }}>
-                <div style={{
-                  background: 'var(--accent-bg)',
-                  border: '1px solid #bfdbfe',
-                  borderRadius: 'var(--radius-md)',
-                  padding: '1rem', textAlign: 'center',
-                }}>
-                  <p style={{ fontSize: '2rem', fontWeight: 600, color: 'var(--accent)', lineHeight: 1 }}>
-                    {final.hr_bpm}
-                  </p>
-                  <p style={{ fontSize: '11px', color: '#3b82f6', marginTop: '4px' }}>BPM · Heart rate</p>
-                </div>
-                {final.rr_bpm && (
-                  <div style={{
-                    background: 'var(--surface2)',
-                    border: '1px solid var(--border)',
-                    borderRadius: 'var(--radius-md)',
-                    padding: '1rem', textAlign: 'center',
-                  }}>
-                    <p style={{ fontSize: '2rem', fontWeight: 600, color: 'var(--text)', lineHeight: 1 }}>
-                      {final.rr_bpm}
-                    </p>
-                    <p style={{ fontSize: '11px', color: 'var(--text3)', marginTop: '4px' }}>BrPM · Respiratory</p>
-                  </div>
-                )}
-              </div>
-
-              {final.route_palm && (
-                <div style={{
-                  padding: '12px 14px',
-                  background: 'var(--warning-bg)',
-                  border: '1px solid #fcd34d',
-                  borderRadius: 'var(--radius-md)',
-                  fontSize: '0.83rem', color: 'var(--warning)',
-                  display: 'flex', alignItems: 'flex-start', gap: '8px',
-                }}>
-                  <span style={{ flexShrink: 0 }}>⚠</span>
-                  <span>
-                    For a more accurate HRV reading, please show your palm to the camera when prompted.
-                  </span>
-                </div>
-              )}
-            </div>
-          )}
+          <p style={{
+            textAlign: 'center', marginTop: '1.25rem',
+            fontSize: 11, color: C.muted,
+          }}>
+            PulseRoute · Investigational use only
+          </p>
         </div>
       </div>
 
-      <p style={{
-        marginTop: '1.5rem', fontSize: '11px', color: 'var(--text3)',
-        fontFamily: 'var(--font-mono)',
-      }}>
-        For investigational use only · PulseRoute v1.0
-      </p>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.25} }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+      `}</style>
     </div>
   )
 }
