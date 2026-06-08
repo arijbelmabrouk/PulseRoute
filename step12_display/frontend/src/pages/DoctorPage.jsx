@@ -3,7 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid, ReferenceLine
 } from 'recharts'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 
 const C = {
   blue:      '#1a5dab',
@@ -47,7 +47,9 @@ function getStatus(val, key) {
 function getRangePct(val, key) {
   const r = RANGES[key]
   if (!r || val == null) return 0
-  return Math.max(0, Math.min(98, ((parseFloat(val) - r.min) / (r.max - r.min)) * 100))
+  return Math.max(0, Math.min(98,
+    ((parseFloat(val) - r.min) / (r.max - r.min)) * 100
+  ))
 }
 
 function statusColor(s) {
@@ -56,7 +58,8 @@ function statusColor(s) {
   return C.muted
 }
 
-function MetricCard({ label, value, unit, sub, rangeKey, flagged, flagText, dimmed }) {
+function MetricCard({ label, value, unit, sub,
+                      rangeKey, flagged, flagText, dimmed }) {
   const status = rangeKey ? getStatus(value, rangeKey) : null
   const pct    = rangeKey ? getRangePct(value, rangeKey) : null
   const sColor = statusColor(status)
@@ -70,23 +73,31 @@ function MetricCard({ label, value, unit, sub, rangeKey, flagged, flagText, dimm
       padding: '1.1rem 1.2rem',
       opacity: dimmed ? 0.45 : 1,
       transition: 'opacity 0.3s, border-color 0.3s',
-      borderTop: `3px solid ${hasVal ? (flagged ? C.amber : sColor || C.blue) : C.border}`,
+      borderTop: `3px solid ${hasVal
+        ? (flagged ? C.amber : sColor || C.blue)
+        : C.border}`,
     }}>
       <p style={{
         fontSize: 11, fontWeight: 600, letterSpacing: '0.07em',
         textTransform: 'uppercase', color: C.muted,
         marginBottom: '0.55rem', fontFamily: C.sans,
       }}>{label}</p>
-
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 5, flexWrap: 'wrap' }}>
+      <div style={{
+        display: 'flex', alignItems: 'baseline',
+        gap: 5, flexWrap: 'wrap',
+      }}>
         <span style={{
           fontSize: '1.9rem', fontWeight: 700, lineHeight: 1,
-          color: hasVal ? (flagged ? C.amber : sColor || C.navy) : C.border,
+          color: hasVal
+            ? (flagged ? C.amber : sColor || C.navy)
+            : C.border,
           fontFamily: C.sans, transition: 'color 0.3s',
           letterSpacing: '-0.02em',
         }}>{value ?? '—'}</span>
         {hasVal && unit && (
-          <span style={{ fontSize: 12, color: C.muted, fontFamily: C.sans }}>{unit}</span>
+          <span style={{
+            fontSize: 12, color: C.muted, fontFamily: C.sans,
+          }}>{unit}</span>
         )}
         {flagged && (
           <span style={{
@@ -97,11 +108,12 @@ function MetricCard({ label, value, unit, sub, rangeKey, flagged, flagText, dimm
           }}>{flagText || 'flag'}</span>
         )}
       </div>
-
       {sub && (
-        <p style={{ fontSize: 11, color: C.muted, marginTop: 4, fontFamily: C.sans }}>{sub}</p>
+        <p style={{
+          fontSize: 11, color: C.muted,
+          marginTop: 4, fontFamily: C.sans,
+        }}>{sub}</p>
       )}
-
       {rangeKey && hasVal && (
         <div style={{ marginTop: '0.85rem' }}>
           <div style={{
@@ -111,7 +123,8 @@ function MetricCard({ label, value, unit, sub, rangeKey, flagged, flagText, dimm
             <div style={{
               position: 'absolute', height: '100%', borderRadius: 4,
               left: `${getRangePct(RANGES[rangeKey].lo, rangeKey)}%`,
-              width: `${getRangePct(RANGES[rangeKey].hi, rangeKey) - getRangePct(RANGES[rangeKey].lo, rangeKey)}%`,
+              width: `${getRangePct(RANGES[rangeKey].hi, rangeKey)
+                - getRangePct(RANGES[rangeKey].lo, rangeKey)}%`,
               background: C.blueLight,
             }} />
             <div style={{
@@ -125,7 +138,8 @@ function MetricCard({ label, value, unit, sub, rangeKey, flagged, flagText, dimm
           </div>
           <div style={{
             display: 'flex', justifyContent: 'space-between',
-            marginTop: 6, fontSize: 10, color: C.muted, fontFamily: C.sans,
+            marginTop: 6, fontSize: 10, color: C.muted,
+            fontFamily: C.sans,
           }}>
             <span>{RANGES[rangeKey].min}</span>
             <span style={{ color: C.blue, fontWeight: 600 }}>
@@ -142,14 +156,16 @@ function MetricCard({ label, value, unit, sub, rangeKey, flagged, flagText, dimm
 function InfoRow({ label, value }) {
   return (
     <div style={{
-      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-      padding: '7px 0', borderBottom: `1px solid ${C.borderLt}`,
+      display: 'flex', justifyContent: 'space-between',
+      alignItems: 'center', padding: '7px 0',
+      borderBottom: `1px solid ${C.borderLt}`,
       fontSize: 13, fontFamily: C.sans,
     }}>
       <span style={{ color: C.muted }}>{label}</span>
-      <span style={{ color: value ? C.navy : C.border, fontWeight: value ? 500 : 400 }}>
-        {value || '—'}
-      </span>
+      <span style={{
+        color: value ? C.navy : C.border,
+        fontWeight: value ? 500 : 400,
+      }}>{value || '—'}</span>
     </div>
   )
 }
@@ -182,11 +198,87 @@ const CustomTooltip = ({ active, payload }) => {
   )
 }
 
+// ── History table row ──────────────────────────────────
+function HistoryRow({ row, isEven }) {
+  const hr      = row.final_hr_bpm   || '—'
+  const rr      = row.final_rr_bpm   || '—'
+  const modality = (row.final_modality || '—').toUpperCase()
+  const routing  = row.routing_decision || '—'
+  const failed   = !!row.failure_reason
+
+  return (
+    <tr style={{
+      background: isEven ? C.bg : C.white,
+      fontSize: 12, fontFamily: C.sans,
+      opacity: failed ? 0.6 : 1,
+    }}>
+      <td style={{ padding: '8px 12px', color: C.muted }}>
+        {row.timestamp?.slice(0, 16) || '—'}
+      </td>
+      <td style={{ padding: '8px 12px', color: C.navy, fontWeight: 500 }}>
+        {row.patient_id || '—'}
+      </td>
+      <td style={{ padding: '8px 12px' }}>
+        <span style={{
+          fontSize: 10, fontWeight: 600, padding: '2px 8px',
+          borderRadius: 20, textTransform: 'uppercase',
+          background: failed ? C.roseBg
+            : modality === 'PALM' ? C.amberBg : C.blueLight,
+          color: failed ? C.rose
+            : modality === 'PALM' ? C.amber : C.blue,
+        }}>
+          {failed ? 'FAILED' : modality}
+        </span>
+      </td>
+      <td style={{ padding: '8px 12px', color: C.navy, fontWeight: 600 }}>
+        {hr} {hr !== '—' ? 'BPM' : ''}
+      </td>
+      <td style={{ padding: '8px 12px', color: C.bodyText }}>
+        {rr} {rr !== '—' ? 'BrPM' : ''}
+      </td>
+      <td style={{ padding: '8px 12px' }}>
+        <span style={{
+          fontSize: 10, fontWeight: 600, padding: '2px 8px',
+          borderRadius: 20, textTransform: 'uppercase',
+          background: routing === 'PALM' ? C.amberBg : C.greenBg,
+          color: routing === 'PALM' ? C.amber : C.green,
+        }}>
+          {routing}
+        </span>
+      </td>
+      <td style={{
+        padding: '8px 12px', color: C.muted, fontSize: 11,
+        maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis',
+      }}>
+        {failed ? row.failure_reason : (row.face_snr_score || '—')}
+      </td>
+    </tr>
+  )
+}
+
+// ─────────────────────────────────────────
+// DoctorPage
+// ─────────────────────────────────────────
+
 export default function DoctorPage() {
   const { state, connected, snrHistory } = useWebSocket('/ws/doctor')
 
-  const final  = state.final || {}
-  const steps  = state.steps || {}
+  // ── Tabs ──────────────────────────────────────────
+  const [activeTab, setActiveTab]   = useState('live')
+
+  // ── Start panel state ─────────────────────────────
+  const [startMode,    setStartMode]   = useState('auto')
+  const [startPid,     setStartPid]    = useState('')
+  const [isStarting,   setIsStarting]  = useState(false)
+
+  // ── History state ──────────────────────────────────
+  const [history,      setHistory]     = useState([])
+  const [historyPid,   setHistoryPid]  = useState('')
+  const [historyLoading, setHistoryLoading] = useState(false)
+
+  // ── Derived state ──────────────────────────────────
+  const final      = state.final || {}
+  const steps      = state.steps || {}
   const s2  = steps['2']  || {}
   const s3  = steps['3']  || {}
   const s6  = steps['6']  || {}
@@ -196,7 +288,8 @@ export default function DoctorPage() {
 
   const isFailed   = state.status === 'failed'
   const isIdle     = state.status === 'idle'
-  const isRunning  = state.status === 'running' || state.status === 'starting'
+  const isRunning  = state.status === 'running'
+                  || state.status === 'starting'
   const isComplete = state.status === 'complete'
   const modality   = state.modality || 'face'
 
@@ -208,11 +301,55 @@ export default function DoctorPage() {
   const hrReliable = s9.hr_reliable !== false
   const motionPct  = s3.motion_pct
 
-  const handleReset = async () => {
-    try { await fetch('http://localhost:8000/api/reset', { method: 'POST' }) }
-    catch(e) {}
+  // Show patient_id from server state if set
+  const serverPid  = state.patient_id || ''
+
+  // ── Actions ────────────────────────────────────────
+  const handleStart = async () => {
+    setIsStarting(true)
+    try {
+      await fetch('http://localhost:8000/api/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode:       startMode,
+          patient_id: startPid.trim(),
+        }),
+      })
+    } catch (e) {
+      console.error('Start failed:', e)
+    }
+    setIsStarting(false)
   }
 
+  const handleReset = async () => {
+    try {
+      await fetch('http://localhost:8000/api/reset', {
+        method: 'POST',
+      })
+    } catch (e) {}
+  }
+
+  const fetchHistory = useCallback(async (pid = '') => {
+    setHistoryLoading(true)
+    try {
+      const url = pid
+        ? `http://localhost:8000/api/history?patient_id=${encodeURIComponent(pid)}`
+        : 'http://localhost:8000/api/history'
+      const res  = await fetch(url)
+      const data = await res.json()
+      setHistory(Array.isArray(data) ? data : [])
+    } catch (e) {
+      setHistory([])
+    }
+    setHistoryLoading(false)
+  }, [])
+
+  useEffect(() => {
+    if (activeTab === 'history') fetchHistory(historyPid)
+  }, [activeTab])
+
+  // ── Render ─────────────────────────────────────────
   return (
     <div style={{
       minHeight: '100vh', background: C.bg,
@@ -221,10 +358,10 @@ export default function DoctorPage() {
 
       {/* ── Nav ── */}
       <nav style={{
-        background: C.white,
-        borderBottom: `1px solid ${C.border}`,
+        background: C.white, borderBottom: `1px solid ${C.border}`,
         padding: '0 2rem',
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        display: 'flex', alignItems: 'center',
+        justifyContent: 'space-between',
         height: 56, position: 'sticky', top: 0, zIndex: 20,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -239,7 +376,9 @@ export default function DoctorPage() {
             }} />
           </div>
           <div>
-            <span style={{ fontWeight: 700, fontSize: 15, color: C.navy }}>PulseRoute</span>
+            <span style={{
+              fontWeight: 700, fontSize: 15, color: C.navy,
+            }}>PulseRoute</span>
             <span style={{
               marginLeft: 10, fontSize: 12, color: C.muted,
               borderLeft: `1px solid ${C.border}`, paddingLeft: 10,
@@ -247,9 +386,23 @@ export default function DoctorPage() {
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+        }}>
+          {/* Patient ID (from server or local) */}
+          {(serverPid || startPid) && (
+            <span style={{
+              fontSize: 12, color: C.navy, fontWeight: 500,
+              padding: '4px 12px', borderRadius: 20,
+              background: C.blueLight, border: `1px solid ${C.border}`,
+            }}>
+              {serverPid || startPid}
+            </span>
+          )}
+
           <span style={{
-            fontSize: 12, fontWeight: 600, padding: '4px 14px', borderRadius: 20,
+            fontSize: 12, fontWeight: 600, padding: '4px 14px',
+            borderRadius: 20,
             background: modality === 'palm' ? C.amberBg : C.blueLight,
             color: modality === 'palm' ? C.amber : C.blue,
             textTransform: 'uppercase', letterSpacing: '0.05em',
@@ -258,33 +411,24 @@ export default function DoctorPage() {
           <div style={{
             display: 'flex', alignItems: 'center', gap: 6,
             fontSize: 13, fontWeight: 500,
-            color: isFailed ? C.rose : isComplete ? C.green : isRunning ? C.blue : C.muted,
+            color: isFailed ? C.rose : isComplete ? C.green
+              : isRunning ? C.blue : C.muted,
           }}>
             <span style={{
               width: 7, height: 7, borderRadius: '50%',
-              background: isFailed ? C.rose : isComplete ? C.green : isRunning ? C.blue : C.muted,
+              background: isFailed ? C.rose : isComplete ? C.green
+                : isRunning ? C.blue : C.muted,
               animation: isRunning ? 'blink 1.4s infinite' : 'none',
             }} />
-            {isFailed ? 'Failed' : isComplete ? 'Complete' : isRunning ? 'Measuring' : 'Idle'}
+            {isFailed ? 'Failed' : isComplete ? 'Complete'
+              : isRunning ? 'Measuring' : 'Idle'}
           </div>
 
           <span style={{
-            fontSize: 11, fontWeight: 600, color: connected ? C.green : C.muted,
+            fontSize: 11, fontWeight: 600,
+            color: connected ? C.green : C.muted,
             letterSpacing: '0.06em', textTransform: 'uppercase',
           }}>{connected ? 'Live' : 'Reconnecting'}</span>
-
-          {(isComplete || isFailed) && (
-            <button onClick={handleReset} style={{
-              fontSize: 13, fontWeight: 600, color: C.blue,
-              background: C.blueLight, border: 'none',
-              borderRadius: 20, padding: '6px 18px', cursor: 'pointer',
-              transition: 'background 0.2s',
-            }}
-            onMouseEnter={e => e.currentTarget.style.background = '#d0e4f7'}
-            onMouseLeave={e => e.currentTarget.style.background = C.blueLight}>
-              Re-measure
-            </button>
-          )}
         </div>
       </nav>
 
@@ -298,204 +442,493 @@ export default function DoctorPage() {
         }} />
       </div>
 
-      <div style={{ padding: '1.5rem 2rem', maxWidth: 1280, margin: '0 auto' }}>
+      {/* ── Start / Control panel ── */}
+      <div style={{
+        background: C.white, borderBottom: `1px solid ${C.border}`,
+        padding: '0.75rem 2rem',
+        display: 'flex', alignItems: 'center', gap: 12,
+      }}>
+        {/* Patient ID */}
+        <input
+          value={startPid}
+          onChange={e => setStartPid(e.target.value)}
+          placeholder="Patient name / ID"
+          disabled={isRunning}
+          style={{
+            padding: '7px 14px', borderRadius: 20, fontSize: 13,
+            border: `1px solid ${C.border}`, fontFamily: C.sans,
+            background: isRunning ? C.bg : C.white,
+            color: C.navy, outline: 'none', width: 200,
+          }}
+        />
 
-        {/* ── Alert banners ── */}
-        {isFailed && (
-          <div style={{
-            padding: '12px 16px', marginBottom: '1.25rem', borderRadius: 10,
-            background: C.roseBg, border: `1px solid ${C.rose}44`,
-            fontSize: 13, color: C.rose, fontWeight: 500,
-          }}>
-            Measurement failed — {state.message || 'signal too weak for reliable results'}. Ask the patient to improve lighting and re-measure.
-          </div>
-        )}
-        {!isFailed && !hrReliable && s9.hr_agreement && (
-          <div style={{
-            padding: '10px 16px', marginBottom: '1rem', borderRadius: 10,
-            background: C.amberBg, border: `1px solid ${C.amber}44`,
-            fontSize: 13, color: C.amber, fontWeight: 500,
-          }}>
-            HR low confidence — FFT and peak detection disagree by {s9.hr_agreement} BPM. Interpret with caution.
-          </div>
-        )}
-        {isRunning && modality === 'palm' && (
-          <div style={{
-            padding: '10px 16px', marginBottom: '1rem', borderRadius: 10,
-            background: C.blueLight, border: `1px solid ${C.blue}44`,
-            fontSize: 13, color: C.blue, fontWeight: 500,
-            display: 'flex', alignItems: 'center', gap: 8,
-          }}>
-            <span style={{
-              width: 6, height: 6, borderRadius: '50%', background: C.blue,
-              animation: 'blink 1.4s infinite', flexShrink: 0,
-            }} />
-            Palm mode active — patient is showing palm to camera
-          </div>
-        )}
-
-        {/* ── Main grid ── */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 280px', gap: 16 }}>
-
-          <div>
-            {/* Primary vitals */}
-            <p style={{
-              fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
-              textTransform: 'uppercase', color: C.muted,
-              marginBottom: '0.75rem',
-            }}>Primary vitals</p>
-            <div style={{
-              display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)',
-              gap: 12, marginBottom: 16,
-            }}>
-              <MetricCard label="Heart rate" value={hrVal} unit="BPM"
-                rangeKey="hr" dimmed={isIdle}
-                flagged={!hrReliable} flagText="low conf" />
-              <MetricCard label="Respiratory" value={rrVal} unit="BrPM"
-                rangeKey="rr" dimmed={isIdle} />
-              <MetricCard label="RMSSD" value={rmssdVal} unit="ms"
-                rangeKey="rmssd" dimmed={isIdle}
-                sub={!s9.hrv_available ? s9.hrv_fps_message : null} />
-              <MetricCard label="HRV assessment"
-                value={isComplete ? final.hrv_overall : s9.hrv_overall}
-                dimmed={isIdle} />
-            </div>
-
-            {/* Signal quality */}
-            <p style={{
-              fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
-              textTransform: 'uppercase', color: C.muted,
-              marginBottom: '0.75rem',
-            }}>Signal quality</p>
-            <div style={{
-              display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)',
-              gap: 12, marginBottom: 16,
-            }}>
-              <MetricCard label="SNR score"
-                value={snrVal != null ? snrVal.toFixed(3) : null}
-                rangeKey="snr" dimmed={isIdle}
-                sub={isComplete ? final.quality_level?.toUpperCase() : null} />
-              <MetricCard label="HR confidence"
-                value={confVal} rangeKey="confidence" dimmed={isIdle} />
-              <MetricCard label="Motion rejected"
-                value={motionPct != null ? `${motionPct}%` : null}
-                dimmed={isIdle}
-                flagged={motionPct > 30} flagText="high"
-                sub={s3.frames_rejected != null ? `${s3.frames_rejected} frames` : null} />
-              <MetricCard label="FFT SNR ratio"
-                value={s7.snr_ratio != null ? `${s7.snr_ratio}x` : null}
-                dimmed={isIdle} />
-            </div>
-
-            {/* SNR chart */}
-            <div style={{
-              background: C.white, border: `1px solid ${C.border}`,
-              borderRadius: 12, padding: '1.25rem',
-            }}>
-              <div style={{
-                display: 'flex', justifyContent: 'space-between',
-                alignItems: 'center', marginBottom: '1rem',
+        {/* Mode toggle */}
+        <div style={{
+          display: 'flex', borderRadius: 20,
+          border: `1px solid ${C.border}`, overflow: 'hidden',
+          opacity: isRunning ? 0.5 : 1,
+        }}>
+          {['auto', 'palm'].map(m => (
+            <button key={m} onClick={() => !isRunning && setStartMode(m)}
+              style={{
+                padding: '7px 18px', fontSize: 12, fontWeight: 600,
+                letterSpacing: '0.04em', textTransform: 'uppercase',
+                border: 'none', cursor: isRunning ? 'default' : 'pointer',
+                background: startMode === m ? C.blue : C.white,
+                color: startMode === m ? C.white : C.muted,
+                transition: 'all 0.2s',
               }}>
+              {m}
+            </button>
+          ))}
+        </div>
+
+        {/* Start / Reset */}
+        {!isRunning ? (
+          <button
+            onClick={handleStart}
+            disabled={isStarting}
+            style={{
+              padding: '7px 22px', borderRadius: 20, fontSize: 13,
+              fontWeight: 600, border: 'none', cursor: 'pointer',
+              background: C.blue, color: C.white,
+              opacity: isStarting ? 0.7 : 1,
+              transition: 'opacity 0.2s',
+            }}>
+            {isStarting ? 'Starting…' : 'Start measurement'}
+          </button>
+        ) : (
+          <button
+            onClick={handleReset}
+            style={{
+              padding: '7px 22px', borderRadius: 20, fontSize: 13,
+              fontWeight: 600, border: `1px solid ${C.rose}`,
+              cursor: 'pointer', background: C.white, color: C.rose,
+              transition: 'background 0.2s',
+            }}>
+            Stop
+          </button>
+        )}
+
+        {(isComplete || isFailed) && (
+          <button
+            onClick={handleReset}
+            style={{
+              padding: '7px 18px', borderRadius: 20, fontSize: 13,
+              fontWeight: 600, cursor: 'pointer',
+              background: C.blueLight, border: 'none', color: C.blue,
+              transition: 'background 0.2s',
+            }}>
+            Re-measure
+          </button>
+        )}
+
+        <div style={{ flex: 1 }} />
+        <span style={{
+          fontSize: 11, color: C.muted, fontFamily: C.sans,
+        }}>
+          Mode: {startMode.toUpperCase()}
+          {startPid ? ` · ${startPid}` : ''}
+        </span>
+      </div>
+
+      {/* ── Tabs ── */}
+      <div style={{
+        background: C.white, borderBottom: `1px solid ${C.border}`,
+        padding: '0 2rem', display: 'flex', gap: 0,
+      }}>
+        {[
+          { id: 'live',    label: 'Live measurement' },
+          { id: 'history', label: 'Session history'  },
+        ].map(tab => (
+          <button key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            style={{
+              padding: '10px 20px', fontSize: 13, fontWeight: 500,
+              border: 'none', background: 'none', cursor: 'pointer',
+              color: activeTab === tab.id ? C.blue : C.muted,
+              borderBottom: activeTab === tab.id
+                ? `2px solid ${C.blue}`
+                : '2px solid transparent',
+              transition: 'color 0.2s, border-color 0.2s',
+              fontFamily: C.sans,
+            }}>
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{
+        padding: '1.5rem 2rem', maxWidth: 1280, margin: '0 auto',
+      }}>
+
+        {/* ══════════════════════════════════════════════
+            LIVE TAB
+        ══════════════════════════════════════════════ */}
+        {activeTab === 'live' && (
+          <>
+            {/* Alerts */}
+            {isFailed && (
+              <div style={{
+                padding: '12px 16px', marginBottom: '1.25rem',
+                borderRadius: 10, background: C.roseBg,
+                border: `1px solid ${C.rose}44`,
+                fontSize: 13, color: C.rose, fontWeight: 500,
+              }}>
+                Measurement failed — {state.message
+                  || 'signal too weak'}. Ask the patient to improve
+                lighting and re-measure.
+              </div>
+            )}
+            {!isFailed && !hrReliable && s9.hr_agreement && (
+              <div style={{
+                padding: '10px 16px', marginBottom: '1rem',
+                borderRadius: 10, background: C.amberBg,
+                border: `1px solid ${C.amber}44`,
+                fontSize: 13, color: C.amber, fontWeight: 500,
+              }}>
+                HR low confidence — FFT and peak detection disagree
+                by {s9.hr_agreement} BPM. Interpret with caution.
+              </div>
+            )}
+            {isRunning && modality === 'palm' && (
+              <div style={{
+                padding: '10px 16px', marginBottom: '1rem',
+                borderRadius: 10, background: C.blueLight,
+                border: `1px solid ${C.blue}44`,
+                fontSize: 13, color: C.blue, fontWeight: 500,
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <span style={{
+                  width: 6, height: 6, borderRadius: '50%',
+                  background: C.blue, animation: 'blink 1.4s infinite',
+                  flexShrink: 0,
+                }} />
+                Palm mode active — patient is showing palm to camera
+              </div>
+            )}
+
+            {/* Main grid */}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 280px',
+              gap: 16,
+            }}>
+              <div>
+                {/* Primary vitals */}
                 <p style={{
                   fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
                   textTransform: 'uppercase', color: C.muted,
-                }}>SNR score — session trace</p>
-                <div style={{ display: 'flex', gap: 16, fontSize: 11, color: C.muted }}>
-                  {[[C.green, 'High', '≥0.70'], [C.amber, 'Medium', '≥0.45'], [C.rose, 'Low', '<0.45']].map(([c, l, r]) => (
-                    <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                      <div style={{ width: 14, height: 2, background: c, borderRadius: 2 }} />
-                      {l} {r}
+                  marginBottom: '0.75rem',
+                }}>Primary vitals</p>
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(4, 1fr)',
+                  gap: 12, marginBottom: 16,
+                }}>
+                  <MetricCard label="Heart rate" value={hrVal} unit="BPM"
+                    rangeKey="hr" dimmed={isIdle}
+                    flagged={!hrReliable} flagText="low conf" />
+                  <MetricCard label="Respiratory" value={rrVal}
+                    unit="BrPM" rangeKey="rr" dimmed={isIdle} />
+                  <MetricCard label="RMSSD" value={rmssdVal} unit="ms"
+                    rangeKey="rmssd" dimmed={isIdle}
+                    sub={!s9.hrv_available
+                      ? s9.hrv_fps_message : null} />
+                  <MetricCard label="HRV assessment"
+                    value={isComplete
+                      ? final.hrv_overall : s9.hrv_overall}
+                    dimmed={isIdle} />
+                </div>
+
+                {/* Signal quality */}
+                <p style={{
+                  fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
+                  textTransform: 'uppercase', color: C.muted,
+                  marginBottom: '0.75rem',
+                }}>Signal quality</p>
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(4, 1fr)',
+                  gap: 12, marginBottom: 16,
+                }}>
+                  <MetricCard label="SNR score"
+                    value={snrVal != null
+                      ? snrVal.toFixed(3) : null}
+                    rangeKey="snr" dimmed={isIdle}
+                    sub={isComplete
+                      ? final.quality_level?.toUpperCase() : null} />
+                  <MetricCard label="HR confidence"
+                    value={confVal} rangeKey="confidence"
+                    dimmed={isIdle} />
+                  <MetricCard label="Motion rejected"
+                    value={motionPct != null
+                      ? `${motionPct}%` : null}
+                    dimmed={isIdle}
+                    flagged={motionPct > 30} flagText="high"
+                    sub={s3.frames_rejected != null
+                      ? `${s3.frames_rejected} frames` : null} />
+                  <MetricCard label="FFT SNR ratio"
+                    value={s7.snr_ratio != null
+                      ? `${s7.snr_ratio}x` : null}
+                    dimmed={isIdle} />
+                </div>
+
+                {/* SNR chart */}
+                <div style={{
+                  background: C.white, border: `1px solid ${C.border}`,
+                  borderRadius: 12, padding: '1.25rem',
+                }}>
+                  <div style={{
+                    display: 'flex', justifyContent: 'space-between',
+                    alignItems: 'center', marginBottom: '1rem',
+                  }}>
+                    <p style={{
+                      fontSize: 11, fontWeight: 700,
+                      letterSpacing: '0.08em', textTransform: 'uppercase',
+                      color: C.muted,
+                    }}>SNR score — session trace</p>
+                    <div style={{
+                      display: 'flex', gap: 16,
+                      fontSize: 11, color: C.muted,
+                    }}>
+                      {[
+                        [C.green, 'High',   '≥0.70'],
+                        [C.amber, 'Medium', '≥0.45'],
+                        [C.rose,  'Low',    '<0.45'],
+                      ].map(([c, l, r]) => (
+                        <div key={l} style={{
+                          display: 'flex', alignItems: 'center', gap: 5,
+                        }}>
+                          <div style={{
+                            width: 14, height: 2,
+                            background: c, borderRadius: 2,
+                          }} />
+                          {l} {r}
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  </div>
+                  {snrHistory?.length > 1 ? (
+                    <ResponsiveContainer width="100%" height={150}>
+                      <LineChart data={snrHistory}
+                        margin={{ top: 4, right: 8,
+                                  left: -20, bottom: 0 }}>
+                        <CartesianGrid strokeDasharray="4 4"
+                          stroke={C.borderLt} />
+                        <XAxis dataKey="t" hide />
+                        <YAxis domain={[0, 1]} tick={{
+                          fontSize: 11, fill: C.muted,
+                          fontFamily: C.sans,
+                        }} />
+                        <ReferenceLine y={0.70} stroke={C.green}
+                          strokeDasharray="5 3" strokeWidth={1} />
+                        <ReferenceLine y={0.45} stroke={C.amber}
+                          strokeDasharray="5 3" strokeWidth={1} />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Line type="monotone" dataKey="snr"
+                          stroke={C.blue} strokeWidth={2}
+                          dot={false} isAnimationActive={false} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div style={{
+                      height: 150, display: 'flex',
+                      alignItems: 'center', justifyContent: 'center',
+                      fontSize: 13, color: C.muted,
+                    }}>
+                      {isIdle
+                        ? 'Awaiting pipeline start'
+                        : 'Collecting trace data…'}
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {snrHistory?.length > 1 ? (
-                <ResponsiveContainer width="100%" height={150}>
-                  <LineChart data={snrHistory} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="4 4" stroke={C.borderLt} />
-                    <XAxis dataKey="t" hide />
-                    <YAxis domain={[0, 1]}
-                      tick={{ fontSize: 11, fill: C.muted, fontFamily: C.sans }} />
-                    <ReferenceLine y={0.70} stroke={C.green} strokeDasharray="5 3" strokeWidth={1} />
-                    <ReferenceLine y={0.45} stroke={C.amber} strokeDasharray="5 3" strokeWidth={1} />
-                    <Tooltip content={<CustomTooltip />} />
-                    <Line type="monotone" dataKey="snr" stroke={C.blue}
-                      strokeWidth={2} dot={false} isAnimationActive={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              ) : (
+              {/* Subject profile panel */}
+              <div style={{
+                display: 'flex', flexDirection: 'column', gap: 12,
+              }}>
                 <div style={{
-                  height: 150, display: 'flex', alignItems: 'center',
-                  justifyContent: 'center', fontSize: 13, color: C.muted,
+                  background: C.white, border: `1px solid ${C.border}`,
+                  borderRadius: 12, padding: '1.1rem',
                 }}>
-                  {isIdle ? 'Awaiting pipeline start' : 'Collecting trace data…'}
+                  <p style={{
+                    fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
+                    textTransform: 'uppercase', color: C.muted,
+                    marginBottom: '0.75rem',
+                  }}>Subject profile</p>
+                  <InfoRow label="Patient"
+                    value={serverPid || startPid || null} />
+                  <InfoRow label="ITA"
+                    value={s2.ita != null ? String(s2.ita) : null} />
+                  <InfoRow label="Fitzpatrick"
+                    value={s2.fitzpatrick} />
+                  <InfoRow label="Profile"
+                    value={s2.profile_valid === true ? 'Valid'
+                      : s2.profile_valid === false ? 'Fallback' : null} />
+                  <InfoRow label="Calib HR"
+                    value={s2.hr_estimate
+                      ? `${s2.hr_estimate} BPM` : null} />
+                  <InfoRow label="Signal std"
+                    value={s6.filtered_std != null
+                      ? s6.filtered_std.toFixed(5) : null} />
+                  <InfoRow label="BP cutoff"
+                    value={s6.bandpass_low_hz != null
+                      ? `${s6.bandpass_low_hz} Hz` : null} />
+                  <InfoRow label="FPS"
+                    value={s3.fps ? `${s3.fps}` : null} />
                 </div>
+
+                <div style={{
+                  background: C.white, border: `1px solid ${C.border}`,
+                  borderRadius: 12, padding: '1.1rem',
+                }}>
+                  <p style={{
+                    fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
+                    textTransform: 'uppercase', color: C.muted,
+                    marginBottom: '0.75rem',
+                  }}>Pipeline steps</p>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {[1,2,3,4,5,6,7,8,9,10,11].map(n => (
+                      <StepPip key={n} n={n}
+                        done={!!steps[String(n)]} />
+                    ))}
+                  </div>
+                </div>
+
+                {isComplete && (
+                  <div style={{
+                    background: C.white, border: `1px solid ${C.border}`,
+                    borderRadius: 12, padding: '1.1rem',
+                  }}>
+                    <p style={{
+                      fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
+                      textTransform: 'uppercase', color: C.muted,
+                      marginBottom: '0.75rem',
+                    }}>Routing decision</p>
+                    <div style={{
+                      padding: '8px 14px', borderRadius: 20,
+                      textAlign: 'center',
+                      fontSize: 13, fontWeight: 600,
+                      background: final.route_palm
+                        ? C.amberBg : C.greenBg,
+                      color: final.route_palm ? C.amber : C.green,
+                    }}>
+                      {final.route_palm
+                        ? 'Palm (auto-routed)' : 'Face accepted'}
+                    </div>
+                    {final.routing_reason && (
+                      <p style={{
+                        fontSize: 11, color: C.muted,
+                        marginTop: 8, lineHeight: 1.5,
+                        textAlign: 'center',
+                      }}>{final.routing_reason}</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ══════════════════════════════════════════════
+            HISTORY TAB
+        ══════════════════════════════════════════════ */}
+        {activeTab === 'history' && (
+          <div>
+            {/* Filter bar */}
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 10,
+              marginBottom: '1rem',
+            }}>
+              <input
+                value={historyPid}
+                onChange={e => setHistoryPid(e.target.value)}
+                placeholder="Filter by patient name / ID"
+                style={{
+                  padding: '7px 14px', borderRadius: 20, fontSize: 13,
+                  border: `1px solid ${C.border}`, fontFamily: C.sans,
+                  color: C.navy, outline: 'none', width: 260,
+                  background: C.white,
+                }}
+              />
+              <button
+                onClick={() => fetchHistory(historyPid)}
+                style={{
+                  padding: '7px 20px', borderRadius: 20,
+                  fontSize: 13, fontWeight: 600,
+                  background: C.blue, color: C.white,
+                  border: 'none', cursor: 'pointer',
+                }}>
+                {historyLoading ? 'Loading…' : 'Search'}
+              </button>
+              {historyPid && (
+                <button
+                  onClick={() => {
+                    setHistoryPid('')
+                    fetchHistory('')
+                  }}
+                  style={{
+                    padding: '7px 16px', borderRadius: 20,
+                    fontSize: 13, background: C.bg, color: C.muted,
+                    border: `1px solid ${C.border}`, cursor: 'pointer',
+                  }}>
+                  Clear
+                </button>
+              )}
+              <span style={{
+                marginLeft: 'auto', fontSize: 12, color: C.muted,
+              }}>
+                {history.length} session{history.length !== 1 ? 's' : ''}
+              </span>
+            </div>
+
+            {/* Table */}
+            <div style={{
+              background: C.white, border: `1px solid ${C.border}`,
+              borderRadius: 12, overflow: 'hidden',
+            }}>
+              {history.length === 0 ? (
+                <div style={{
+                  padding: '3rem', textAlign: 'center',
+                  fontSize: 13, color: C.muted,
+                }}>
+                  {historyLoading
+                    ? 'Loading sessions…'
+                    : 'No sessions found. Start a measurement to log data.'}
+                </div>
+              ) : (
+                <table style={{
+                  width: '100%', borderCollapse: 'collapse',
+                  fontSize: 12, fontFamily: C.sans,
+                }}>
+                  <thead>
+                    <tr style={{ background: C.bg }}>
+                      {[
+                        'Timestamp', 'Patient', 'Modality',
+                        'HR', 'RR', 'Routing', 'SNR / Note',
+                      ].map(h => (
+                        <th key={h} style={{
+                          padding: '9px 12px', textAlign: 'left',
+                          fontSize: 11, fontWeight: 700,
+                          letterSpacing: '0.07em',
+                          textTransform: 'uppercase', color: C.muted,
+                          borderBottom: `1px solid ${C.border}`,
+                        }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {history.map((row, i) => (
+                      <HistoryRow key={i} row={row} isEven={i % 2 === 0} />
+                    ))}
+                  </tbody>
+                </table>
               )}
             </div>
           </div>
-
-          {/* ── Subject profile panel ── */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <div style={{
-              background: C.white, border: `1px solid ${C.border}`,
-              borderRadius: 12, padding: '1.1rem',
-            }}>
-              <p style={{
-                fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
-                textTransform: 'uppercase', color: C.muted, marginBottom: '0.75rem',
-              }}>Subject profile</p>
-              <InfoRow label="ITA"         value={s2.ita != null ? String(s2.ita) : null} />
-              <InfoRow label="Fitzpatrick" value={s2.fitzpatrick} />
-              <InfoRow label="Profile"     value={s2.profile_valid === true ? 'Valid' : s2.profile_valid === false ? 'Fallback' : null} />
-              <InfoRow label="Calib HR"    value={s2.hr_estimate ? `${s2.hr_estimate} BPM` : null} />
-              <InfoRow label="Signal std"  value={s6.filtered_std != null ? s6.filtered_std.toFixed(5) : null} />
-              <InfoRow label="BP cutoff"   value={s6.bandpass_low_hz != null ? `${s6.bandpass_low_hz} Hz` : null} />
-              <InfoRow label="FPS"         value={s3.fps ? `${s3.fps}` : null} />
-            </div>
-
-            <div style={{
-              background: C.white, border: `1px solid ${C.border}`,
-              borderRadius: 12, padding: '1.1rem',
-            }}>
-              <p style={{
-                fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
-                textTransform: 'uppercase', color: C.muted, marginBottom: '0.75rem',
-              }}>Pipeline steps</p>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                {[1,2,3,4,5,6,7,8,9,10,11].map(n => (
-                  <StepPip key={n} n={n} done={!!steps[String(n)]} />
-                ))}
-              </div>
-            </div>
-
-            {isComplete && (
-              <div style={{
-                background: C.white, border: `1px solid ${C.border}`,
-                borderRadius: 12, padding: '1.1rem',
-              }}>
-                <p style={{
-                  fontSize: 11, fontWeight: 700, letterSpacing: '0.08em',
-                  textTransform: 'uppercase', color: C.muted, marginBottom: '0.75rem',
-                }}>Routing decision</p>
-                <div style={{
-                  padding: '8px 14px', borderRadius: 20, textAlign: 'center',
-                  fontSize: 13, fontWeight: 600,
-                  background: final.route_palm ? C.amberBg : C.greenBg,
-                  color: final.route_palm ? C.amber : C.green,
-                }}>
-                  {final.route_palm ? 'Palm (auto-routed)' : 'Face accepted'}
-                </div>
-                {final.routing_reason && (
-                  <p style={{
-                    fontSize: 11, color: C.muted, marginTop: 8,
-                    lineHeight: 1.5, textAlign: 'center',
-                  }}>{final.routing_reason}</p>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
+        )}
 
         {/* Footer */}
         <div style={{

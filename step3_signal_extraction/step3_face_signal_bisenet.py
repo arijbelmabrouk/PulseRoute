@@ -80,12 +80,6 @@ def run_face_roi_extraction(cap, actual_fps,
         MAX_CALIB_ATTEMPTS times before giving up
         and using population defaults.
 
-        This prevents garbage thresholds from
-        silently propagating through the pipeline
-        when the patient covered their face, was
-        too far from the camera, or had bad lighting
-        during the setup phase.
-
     Input:
         cap          — VideoCapture from Step 1
         actual_fps   — fps from Step 1
@@ -115,14 +109,9 @@ def run_face_roi_extraction(cap, actual_fps,
     phase1_duration = min(5, duration_sec // 2)
     phase2_duration = duration_sec - phase1_duration
 
-    # ── Attempt loop ──────────────────────────────
-    # Runs the calibration phase up to MAX_CALIB_ATTEMPTS
-    # times if validation fails. Phase 1 (mask setup)
-    # only runs once — Phase 2 (pixel sampling) retries.
-
     profile          = None
     attempt          = 0
-    mask_established = False  # Phase 1 only runs once
+    mask_established = False
 
     while attempt < MAX_CALIB_ATTEMPTS:
         attempt += 1
@@ -260,10 +249,8 @@ def run_face_roi_extraction(cap, actual_fps,
         )
 
         if valid:
-            # Calibration accepted — proceed
             break
 
-        # Calibration rejected — show error and retry
         print(f"\n  ⚠ Calibration quality check FAILED:")
         print(f"  {reason}")
 
@@ -272,7 +259,6 @@ def run_face_roi_extraction(cap, actual_fps,
                 cap, reason, attempt, MAX_CALIB_ATTEMPTS
             )
         else:
-            # All attempts exhausted — use defaults
             print(f"\n  ⚠ All {MAX_CALIB_ATTEMPTS} calibration "
                   f"attempts failed.")
             print(f"  Using population defaults. "
@@ -302,16 +288,8 @@ def run_face_roi_extraction(cap, actual_fps,
 
 def _show_retry_screen(cap, reason,
                         attempt, max_attempts):
-    """
-    Show a clear error screen for 4 seconds while
-    the patient reads the problem and repositions.
-
-    Reads frames from cap to keep the camera warm
-    but only displays the error message overlay.
-    """
     deadline = time.time() + 4.0
 
-    # Map reason keywords to actionable instructions
     if "moved" in reason.lower() or \
        "noisy" in reason.lower() or \
        "occluded" in reason.lower():
@@ -339,7 +317,6 @@ def _show_retry_screen(cap, reason,
         if not ret:
             break
 
-        # Dark overlay
         overlay        = frame.copy()
         overlay[:]     = (20, 20, 20)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
@@ -347,7 +324,6 @@ def _show_retry_screen(cap, reason,
         remaining = max(0, deadline - time.time())
         h, w      = frame.shape[:2]
 
-        # Attempt counter
         cv2.putText(
             frame,
             f"Calibration attempt {attempt}/{max_attempts} failed",
@@ -356,10 +332,9 @@ def _show_retry_screen(cap, reason,
             0.65, (0, 80, 255), 2
         )
 
-        # Problem description — split into lines
-        words      = reason.split()
-        lines      = []
-        current    = ""
+        words   = reason.split()
+        lines   = []
+        current = ""
         for word in words:
             if len(current) + len(word) + 1 > 55:
                 lines.append(current)
@@ -370,7 +345,7 @@ def _show_retry_screen(cap, reason,
             lines.append(current)
 
         y = 95
-        for line in lines[:3]:  # max 3 lines
+        for line in lines[:3]:
             cv2.putText(
                 frame, line,
                 (20, y),
@@ -379,7 +354,6 @@ def _show_retry_screen(cap, reason,
             )
             y += 28
 
-        # Instruction — prominent
         cv2.putText(
             frame,
             f"→  {instruction}",
@@ -387,8 +361,6 @@ def _show_retry_screen(cap, reason,
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7, (0, 255, 150), 2
         )
-
-        # Countdown
         cv2.putText(
             frame,
             f"Retrying in {remaining:.0f}s...",
@@ -403,7 +375,6 @@ def _show_retry_screen(cap, reason,
 
 def _draw_setup_hud(frame, state,
                      remaining, label, color):
-    """Draw setup phase HUD on frame (in-place)."""
     for msk, msk_color in [
         (state.forehead_mask, (0, 255, 0)),
         (state.cheek_mask,    (255, 0, 0))
@@ -447,7 +418,8 @@ def _draw_setup_hud(frame, state,
 def run_face_signal_extraction(cap, actual_fps,
                                 state,
                                 duration_sec=30,
-                                profile=None):
+                                profile=None,
+                                on_frame=None):   # ← NEW
     """
     Run Step 3 RGB signal extraction using face mask.
 
@@ -457,6 +429,9 @@ def run_face_signal_extraction(cap, actual_fps,
         state        — FaceROIState with mask + ITA
         duration_sec — recording length in seconds
         profile      — SubjectProfile from Step 2
+        on_frame     — optional callback(frame_bgr, mask)
+                       called on every accepted frame
+                       for live camera feed publishing
 
     Output:
         r, g, b        — raw signal arrays (N,)
@@ -481,5 +456,6 @@ def run_face_signal_extraction(cap, actual_fps,
         get_mask_fn, get_ita_fn,
         modality     = "face",
         duration_sec = duration_sec,
-        profile      = profile
+        profile      = profile,
+        on_frame     = on_frame        # ← NEW
     )

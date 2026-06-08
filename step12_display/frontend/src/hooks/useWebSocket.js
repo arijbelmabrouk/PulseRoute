@@ -1,73 +1,116 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 
-export function useWebSocket(endpoint) {
-  const [state, setState]         = useState({ status: 'idle', progress: 0, steps: {} })
-  const [connected, setConnected] = useState(false)
-  const [snrHistory, setSnrHistory] = useState([])
-  const wsRef           = useRef(null)
-  const reconnectTimer  = useRef(null)
+const WS_BASE = 'ws://localhost:8000'
+const RECONNECT_DELAY_MS = 2500
+
+/**
+ * useWebSocket — connects to the PulseRoute dashboard server.
+ *
+ * Handles two message types:
+ *   1. State events   — merged into `state` and tracked in `snrHistory`
+ *   2. Frame messages — { type: "frame", frame: "<base64 JPEG>" }
+ *                       stored in `latestFrame` as a data URL
+ *
+ * Returns
+ * -------
+ * state       : current pipeline state object
+ * connected   : boolean WebSocket connection status
+ * snrHistory  : array of { t, snr } for the SNR chart
+ * latestFrame : data URL string of the latest annotated frame,
+ *               or null if no frame received yet
+ */
+export function useWebSocket(path) {
+  const [state,       setState]       = useState({
+    status: 'idle', progress: 0, steps: {},
+  })
+  const [connected,   setConnected]   = useState(false)
+  const [snrHistory,  setSnrHistory]  = useState([])
+  const [latestFrame, setLatestFrame] = useState(null)
+
+  const wsRef      = useRef(null)
+  const retryTimer = useRef(null)
+  const mountedRef = useRef(true)
 
   const connect = useCallback(() => {
-    // Vite proxy forwards /ws → ws://localhost:8000
-    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-    const host     = window.location.host
-    const url      = `${protocol}://${host}${endpoint}`
+    if (!mountedRef.current) return
 
-    const ws = new WebSocket(url)
+    const ws = new WebSocket(`${WS_BASE}${path}`)
     wsRef.current = ws
 
     ws.onopen = () => {
+      if (!mountedRef.current) return
       setConnected(true)
-      clearTimeout(reconnectTimer.current)
     }
 
     ws.onmessage = (evt) => {
+      if (!mountedRef.current) return
       try {
-        const data = JSON.parse(evt.data)
-        // Ignore keep-alive pings
-        if (data.ping) return
+        const msg = JSON.parse(evt.data)
 
-        setState(prev => ({
-          ...prev,
-          ...data,
-          steps: { ...prev.steps, ...(data.steps || {}) },
-        }))
+        // ── Frame message ────────────────────────
+        if (msg.type === 'frame' && msg.frame) {
+          setLatestFrame(`data:image/jpeg;base64,${msg.frame}`)
+          return
+        }
 
-        // Track SNR history for the doctor chart
-        if (data.snr_score !== undefined) {
-          setSnrHistory(h => [
-            ...h.slice(-59),
-            { t: h.length, snr: parseFloat(data.snr_score.toFixed(3)) }
+        // ── Ping (keepalive) ─────────────────────
+        if (msg.ping) return
+
+        // ── State event ──────────────────────────
+        setState(prev => {
+          const next = {
+            ...prev,
+            ...msg,
+            steps: {
+              ...prev.steps,
+              ...(msg.steps || {}),
+            },
+          }
+          return next
+        })
+
+        // Track SNR score history for chart
+        const snr = msg.snr_score
+          ?? msg.final?.snr_score
+          ?? null
+        if (snr != null) {
+          setSnrHistory(prev => [
+            ...prev.slice(-59),   // keep last 60 points
+            { t: Date.now(), snr: parseFloat(snr) },
           ])
         }
-        // Also track from final results
-        if (data.final?.snr_score !== undefined) {
-          setSnrHistory(h => [
-            ...h.slice(-59),
-            { t: h.length, snr: parseFloat(data.final.snr_score.toFixed(3)) }
-          ])
+
+        // Clear frame when pipeline resets to idle
+        if (msg.status === 'idle') {
+          setLatestFrame(null)
+          setSnrHistory([])
         }
-      } catch (_) { /* ignore parse errors */ }
+
+      } catch {
+        // Ignore malformed messages
+      }
     }
 
     ws.onclose = () => {
+      if (!mountedRef.current) return
       setConnected(false)
-      // Reconnect after 3 seconds
-      reconnectTimer.current = setTimeout(connect, 3000)
+      retryTimer.current = setTimeout(connect, RECONNECT_DELAY_MS)
     }
 
     ws.onerror = () => {
       ws.close()
     }
-  }, [endpoint])
+  }, [path])
 
   useEffect(() => {
+    mountedRef.current = true
     connect()
     return () => {
-      clearTimeout(reconnectTimer.current)
+      mountedRef.current = false
+      clearTimeout(retryTimer.current)
       wsRef.current?.close()
     }
   }, [connect])
 
-  return { state, connected, snrHistory }
+  return { state, connected, snrHistory, latestFrame }
 }

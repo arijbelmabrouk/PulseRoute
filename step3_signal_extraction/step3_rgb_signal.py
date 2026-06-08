@@ -22,14 +22,13 @@ from collections import deque
 #   Frames where the green channel deviates more
 #   than the patient's personal threshold from
 #   the rolling mean are silently skipped.
-#   The buffer waits for a clean frame.
-#   Handles coughing, talking, swallowing, and
-#   sudden movements without corrupting the signal.
-#   The patient does not need to know — the timer
-#   simply extends until enough clean frames arrive.
 #
-# No neural network — pure NumPy mathematics
-# informed by skin tone and SubjectProfile.
+# NEW — on_frame callback:
+#   Optional callback(frame_bgr, combined_mask)
+#   called on every accepted clean frame.
+#   Used by run_web.py to publish annotated JPEG
+#   frames to the patient's live camera feed via
+#   WebSocket. Throttling is handled by the caller.
 # ─────────────────────────────────────────
 
 # Default signal buffer duration in seconds
@@ -41,9 +40,7 @@ MIN_ROI_PIXELS = 50
 # Rolling window for motion baseline (frames)
 MOTION_WINDOW_SIZE = 10
 
-# Max recording time multiplier — prevents infinite
-# loop if patient moves constantly
-# E.g. duration_sec=35 → max wall time = 35 × 2.5 = 87.5s
+# Max recording time multiplier
 MAX_DURATION_MULTIPLIER = 2.5
 
 
@@ -55,21 +52,6 @@ def compute_adaptive_thresholds(ita_angle):
     """
     Compute pixel quality thresholds adapted to
     subject skin tone via ITA angle.
-
-    Scientific basis:
-        Melanin absorbs light before it reaches
-        capillaries — darker skin has lower baseline
-        pixel values for the same lighting conditions.
-        Fixed thresholds designed for light skin
-        misclassify dark skin pixels as underexposed
-        and overexposed at different absolute values.
-
-    ITA scale:
-        >  55 → FST I-II   (Very Light)
-        28–55 → FST III    (Light-Medium)
-        10–28 → FST IV     (Medium)
-       -30–10 → FST V      (Medium-Dark)
-        < -30 → FST VI     (Dark)
     """
     ita_clamped    = max(-60.0, min(90.0, float(ita_angle)))
     ita_normalized = (ita_clamped + 60.0) / 150.0
@@ -89,45 +71,16 @@ class MotionDetector:
     Per-frame motion artifact detector.
 
     Uses the patient's personal motion threshold
-    from SubjectProfile (3× their own baseline
+    from SubjectProfile (5× their own baseline
     green channel noise floor).
-
-    Logic:
-        Maintain a rolling window of the last
-        MOTION_WINDOW_SIZE clean green channel values.
-        For each new frame, compare its green mean
-        to the rolling mean.
-        If |delta| > threshold → motion artifact → skip.
-        If |delta| <= threshold → clean frame → accept.
-
-    This is personal because:
-        - A fidgety patient's rolling std is higher
-          so their threshold is higher — fair.
-        - A still patient's threshold is tighter
-          so genuine artifacts are caught — accurate.
-        - If no profile provided, a conservative
-          fixed threshold is used as fallback.
-
-    Attributes:
-        threshold     — motion rejection threshold
-        window        — deque of recent clean G values
-        rejected      — count of rejected frames
-        accepted      — count of accepted frames
     """
 
     def __init__(self, profile=None):
-        """
-        Input:
-            profile — SubjectProfile (optional).
-                      If None, uses conservative default.
-        """
         if profile is not None and \
            profile.motion_threshold is not None:
             self.threshold = profile.motion_threshold
             self._source   = "personal"
         else:
-            # Conservative fallback — no profile
-            # 6.0 is 3× a typical std of 2.0
             self.threshold = 6.0
             self._source   = "default"
 
@@ -136,19 +89,6 @@ class MotionDetector:
         self.accepted = 0
 
     def is_clean(self, mean_g):
-        """
-        Decide if this frame is clean or a motion artifact.
-
-        If window has fewer than 3 frames, always accept
-        — need baseline before rejection starts.
-
-        Input:
-            mean_g — green channel mean for this frame
-
-        Output:
-            True  — frame is clean, add to buffer
-            False — motion artifact, skip this frame
-        """
         if len(self.window) < 3:
             self.window.append(mean_g)
             self.accepted += 1
@@ -161,20 +101,17 @@ class MotionDetector:
             self.rejected += 1
             return False
 
-        # Clean frame — update rolling window
         self.window.append(mean_g)
         self.accepted += 1
         return True
 
     def get_rejection_rate(self):
-        """Fraction of frames rejected (0.0–1.0)."""
         total = self.rejected + self.accepted
         if total == 0:
             return 0.0
         return round(self.rejected / total, 3)
 
     def print_summary(self):
-        """Print motion rejection statistics."""
         rate = self.get_rejection_rate()
         print(f"  Motion detector:  "
               f"threshold={self.threshold:.4f} "
@@ -188,10 +125,7 @@ class MotionDetector:
 # ─────────────────────────────────────────
 
 def extract_rgb_signal(frame_rgb, mask, ita_angle=55.0):
-    """
-    Extract mean R, G, B from ROI pixels with
-    ITA-adaptive quality filtering.
-    """
+    """Extract mean R, G, B from ROI pixels."""
     roi_pixels = frame_rgb[mask == 1]
 
     if len(roi_pixels) < MIN_ROI_PIXELS:
@@ -228,9 +162,7 @@ def extract_rgb_signal(frame_rgb, mask, ita_angle=55.0):
     mean_b = float(means[2])
 
     return (
-        mean_r,
-        mean_g,
-        mean_b,
+        mean_r, mean_g, mean_b,
         len(pixels_to_use),
         round(quality_ratio, 3),
         (over_thresh, under_thresh)
@@ -242,11 +174,6 @@ def extract_rgb_signal(frame_rgb, mask, ita_angle=55.0):
 # ─────────────────────────────────────────
 
 class RGBSignalBuffer:
-    """
-    Accumulates per-frame RGB mean values over time.
-    Only clean frames (passed motion detector) are added.
-    """
-
     def __init__(self, actual_fps,
                  duration_sec=SIGNAL_DURATION_SEC):
         self.actual_fps   = actual_fps
@@ -383,10 +310,8 @@ def assess_signal_quality(buffer):
     quality_ok        = len(issues) == 0
 
     return (
-        quality_ok,
-        issues,
-        round(snr_estimate, 3),
-        threshold_summary
+        quality_ok, issues,
+        round(snr_estimate, 3), threshold_summary
     )
 
 
@@ -399,50 +324,39 @@ def run_signal_extraction(cap, actual_fps,
                           get_ita_fn=None,
                           modality="face",
                           duration_sec=30,
-                          profile=None):
+                          profile=None,
+                          on_frame=None):   # ← NEW
     """
     Run RGB signal extraction for duration_sec seconds.
 
-    NEW: Accepts optional SubjectProfile.
-    When profile is provided, motion rejection is active:
-        - Frames where green channel deviates by more
-          than profile.motion_threshold from the rolling
-          mean are silently skipped.
-        - The buffer waits for a clean frame.
-        - The recording extends automatically if
-          the patient moves a lot (up to
-          MAX_DURATION_MULTIPLIER × duration_sec).
-        - The patient-facing timer shows clean frame
-          count, not wall time — honest progress.
+    Parameters
+    ----------
+    cap          : VideoCapture from Step 1
+    actual_fps   : measured fps from Step 1
+    get_mask_fn  : callable → (combined, fore, cheek) masks
+    get_ita_fn   : callable → ITA float
+    modality     : 'face' or 'palm'
+    duration_sec : target clean recording seconds
+    profile      : SubjectProfile (optional)
+    on_frame     : optional callback(frame_bgr, combined_mask)
+                   called on every accepted clean frame.
+                   Used by run_web.py to publish annotated
+                   JPEG frames to the patient's live camera
+                   feed via WebSocket. Throttling handled
+                   by the caller (make_frame_callback).
 
-    This makes the pipeline robust to coughing, talking,
-    swallowing, and sudden movements without requiring
-    the patient to stay perfectly still.
-
-    Input:
-        cap          — VideoCapture from Step 1
-        actual_fps   — measured fps from Step 1
-        get_mask_fn  — callable returning
-                       (combined, forehead, cheek) masks
-        get_ita_fn   — callable returning ITA float
-        modality     — 'face' or 'palm' for display
-        duration_sec — target clean recording seconds
-        profile      — SubjectProfile (optional)
-                       None → no motion rejection
-
-    Output:
-        r, g, b        — NumPy signal arrays (clean frames only)
-        fps_measured   — actual fps during recording
-        quality_ok     — bool
-        issues         — list of issue strings
-        thresh_summary — adaptive threshold stats
+    Returns
+    -------
+    r, g, b        : NumPy signal arrays (clean frames only)
+    fps_measured   : actual fps during recording
+    quality_ok     : bool
+    issues         : list of issue strings
+    thresh_summary : adaptive threshold stats
     """
     buffer   = RGBSignalBuffer(actual_fps,
                                duration_sec=duration_sec)
     detector = MotionDetector(profile=profile)
 
-    # Wall-clock deadline — prevents infinite recording
-    # if patient moves constantly
     max_wall_time = duration_sec * MAX_DURATION_MULTIPLIER
     wall_deadline = time.time() + max_wall_time
 
@@ -459,12 +373,11 @@ def run_signal_extraction(cap, actual_fps,
     print("Press Q to stop early")
 
     consecutive_failures = 0
+
     while not buffer.is_full():
-        # Hard wall-clock cap
         if time.time() > wall_deadline:
             print(f"\nMax recording time reached "
-                  f"({max_wall_time:.0f}s). "
-                  f"Stopping.")
+                  f"({max_wall_time:.0f}s). Stopping.")
             break
 
         ret, frame = cap.read()
@@ -506,7 +419,6 @@ def run_signal_extraction(cap, actual_fps,
             is_clean_frame = detector.is_clean(mean_g)
 
         if not is_clean_frame:
-            # Draw rejected frame indicator and skip
             _draw_rejected_hud(
                 frame, buffer, duration_sec,
                 detector, current_ita,
@@ -526,6 +438,16 @@ def run_signal_extraction(cap, actual_fps,
             pixel_count, quality_ratio,
             current_ita, thresholds_used
         )
+
+        # ── Live frame callback ───────────────────
+        # Called on every accepted clean frame.
+        # run_web.py's make_frame_callback() throttles
+        # to every 3rd frame (~10fps) before publishing.
+        if on_frame is not None:
+            try:
+                on_frame(frame, combined_mask)
+            except Exception:
+                pass   # never crash pipeline for a frame
 
         # ── Display ───────────────────────────────
         progress, elapsed = buffer.get_progress()
@@ -641,10 +563,8 @@ def run_signal_extraction(cap, actual_fps,
 def _draw_rejected_hud(frame, buffer, duration_sec,
                         detector, current_ita,
                         forehead_mask, cheek_mask):
-    """Draw motion-rejected frame indicator."""
     progress, elapsed = buffer.get_progress()
 
-    # Red tint on rejected frames
     red_overlay        = np.zeros_like(frame)
     red_overlay[:,:,2] = 60
     cv2.addWeighted(red_overlay, 0.3, frame, 0.7, 0, frame)
