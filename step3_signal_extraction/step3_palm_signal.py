@@ -68,7 +68,9 @@ class PalmROIState:
 # ─────────────────────────────────────────
 
 def run_palm_roi_extraction(cap, actual_fps,
-                             state, duration_sec=10):
+                             state, duration_sec=10,
+                             show_display=True,
+                             on_frame=None):
     """
     Run MediaPipe palm ROI extraction + calibration.
 
@@ -77,11 +79,23 @@ def run_palm_roi_extraction(cap, actual_fps,
         Phase 2 (second half): Sample green channel values
             through mask → build SubjectProfile.
 
+    NEW — on_frame callback:
+        Optional callback(frame_bgr, combined_mask)
+        called every frame with the annotated setup frame.
+        Used by run_web.py to stream Step 2b live to the
+        patient page — same visuals as the OpenCV window.
+
+        The callback receives the frame AFTER _draw_phase_hud
+        has drawn all overlays, so what the patient sees is
+        identical to what the OpenCV window shows.
+
     Input:
         cap          — VideoCapture from Step 1
         actual_fps   — fps from Step 1
         state        — PalmROIState shared object
         duration_sec — total duration (default 10s)
+        show_display — whether to call cv2.imshow
+        on_frame     — optional callback(frame_bgr, mask)
 
     Output:
         palm_profile — SubjectProfile built from palm signal
@@ -140,13 +154,23 @@ def run_palm_roi_extraction(cap, actual_fps,
                         )
                         state.ita = cached_ita
 
+            remaining = phase1_end - time.time()
             _draw_phase_hud(
                 frame, state, palm_visible, cached_ita,
-                max(0, phase1_end - time.time()),
+                max(0, remaining),
                 "Phase 1 — Palm mask setup"
             )
-            cv2.imshow("Step 2b — Palm ROI", frame)
-            cv2.waitKey(1)
+
+            # ── Live feed callback ─────────────────
+            if on_frame is not None:
+                try:
+                    on_frame(frame, state.combined_mask)
+                except Exception:
+                    pass
+
+            if show_display:
+                cv2.imshow("Step 2b — Palm ROI", frame)
+                cv2.waitKey(1)
 
     # ── Phase 2: Calibration sampling ─────────────
     print(f"\nStep 2b Palm — Phase 2: Calibration sampling "
@@ -161,7 +185,8 @@ def run_palm_roi_extraction(cap, actual_fps,
         profile             = SubjectProfile()
         profile.ita         = state.ita
         profile.fitzpatrick = _ita_to_fitzpatrick(state.ita)
-        cv2.destroyAllWindows()
+        if show_display:
+            cv2.destroyAllWindows()
         return profile
 
     with mp_hands.Hands(
@@ -201,16 +226,27 @@ def run_palm_roi_extraction(cap, actual_fps,
                 ))
                 g_calib_samples.append(mean_g)
 
+            remaining = phase2_end - time.time()
             _draw_phase_hud(
                 frame, state, True, state.ita,
-                max(0, phase2_end - time.time()),
+                max(0, remaining),
                 f"Phase 2 — Calibrating "
                 f"({len(g_calib_samples)} samples)"
             )
-            cv2.imshow("Step 2b — Palm ROI", frame)
-            cv2.waitKey(1)
 
-    cv2.destroyAllWindows()
+            # ── Live feed callback ─────────────────
+            if on_frame is not None:
+                try:
+                    on_frame(frame, state.combined_mask)
+                except Exception:
+                    pass
+
+            if show_display:
+                cv2.imshow("Step 2b — Palm ROI", frame)
+                cv2.waitKey(1)
+
+    if show_display:
+        cv2.destroyAllWindows()
 
     # ── Build SubjectProfile ───────────────────────
     g_arr        = np.array(g_calib_samples, dtype=np.float32)
@@ -264,7 +300,10 @@ def run_palm_roi_extraction(cap, actual_fps,
 
 def run_palm_signal_extraction(cap, actual_fps, state,
                                 duration_sec=35,
-                                profile=None):
+                                profile=None,
+                                on_frame=None,
+                                on_progress=None,
+                                show_display=True):
     """
     Run Step 3 RGB signal extraction using palm mask.
 
@@ -292,6 +331,9 @@ def run_palm_signal_extraction(cap, actual_fps, state,
         state        — PalmROIState with mask and ITA
         duration_sec — recording duration (default 35s)
         profile      — SubjectProfile from Step 2b palm
+        on_frame     — optional callback(frame_bgr, mask)
+        on_progress  — optional callback(percent: int)
+        show_display — whether to call cv2.imshow
 
     Output:
         r, g, b        — raw signal arrays (N,)
@@ -317,7 +359,6 @@ def run_palm_signal_extraction(cap, actual_fps, state,
     hands_context.__enter__()
 
     frame_counter   = [0]   # mutable int in closure
-    ita_counter     = [0]
 
     def get_mask_fn(frame_rgb):
         """
@@ -353,7 +394,6 @@ def run_palm_signal_extraction(cap, actual_fps, state,
 
                 # Update ITA every N frames — expensive
                 if frame_counter[0] % EVAL_EVERY_N_FRAMES == 0:
-                    # frame_rgb is RGB, convert for estimate_skin_tone
                     frame_bgr = cv2.cvtColor(
                         frame_rgb, cv2.COLOR_RGB2BGR
                     )
@@ -363,10 +403,8 @@ def run_palm_signal_extraction(cap, actual_fps, state,
                         )
                         state.ita = new_ita
             else:
-                # Palm turned away — hold last mask
                 state.palm_visible = False
         else:
-            # No hand detected — hold last mask
             state.palm_visible = False
 
         return (
@@ -384,15 +422,15 @@ def run_palm_signal_extraction(cap, actual_fps, state,
             get_mask_fn, get_ita_fn,
             modality     = "palm",
             duration_sec = duration_sec,
-            profile      = profile
+            profile      = profile,
+            on_frame     = on_frame,
+            on_progress  = on_progress,
+            show_display = show_display
         )
     finally:
         hands_context.__exit__(None, None, None)
 
-    # FPS drop check — MediaPipe overhead can reduce fps
-    # on slower machines. If measured fps dropped more than
-    # 30% below calibration fps, warn that HR timing
-    # may be less reliable.
+    # FPS drop check
     measured_fps = result[3]  # fps_measured is index 3
     if measured_fps < actual_fps * 0.70:
         print(f"\n⚠ FPS drop detected during palm recording:")

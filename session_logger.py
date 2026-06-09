@@ -44,6 +44,7 @@ LOG_FILE = os.path.join(LOG_DIR, 'sessions.csv')
 CSV_FIELDS = [
     'timestamp',
     'patient_id',          # ← NEW: links session to patient
+    'patient_age',         # ← NEW: patient age for session context
     'mode',
     'ita',
     'fitzpatrick',
@@ -97,6 +98,13 @@ class SessionLogger:
     def set_patient_id(self, patient_id: str):
         """Link this session to a patient name/ID."""
         self._row['patient_id'] = str(patient_id).strip()
+
+    def set_patient_age(self, patient_age):
+        """Record patient age for the current session."""
+        if patient_age is None:
+            self._row['patient_age'] = ''
+        else:
+            self._row['patient_age'] = str(patient_age).strip()
 
     def set_mode(self, mode: str):
         """'auto' or 'palm'"""

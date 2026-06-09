@@ -225,7 +225,12 @@ class RGBSignalBuffer:
                      self.timestamps[0]
         if total_time == 0:
             return self.actual_fps
-        return (len(self.timestamps) - 1) / total_time
+        calculated_fps = (len(self.timestamps) - 1) / total_time
+        # Safety check: if calculated fps is unreasonably low
+        # (e.g., < 5 fps when we expect ~30), fall back to nominal
+        if calculated_fps < 5.0:
+            return self.actual_fps
+        return calculated_fps
 
     def get_progress(self):
         n        = len(self.r_signal)
@@ -325,7 +330,9 @@ def run_signal_extraction(cap, actual_fps,
                           modality="face",
                           duration_sec=30,
                           profile=None,
-                          on_frame=None):   # ← NEW
+                          on_frame=None,
+                          on_progress=None,
+                          show_display=True):
     """
     Run RGB signal extraction for duration_sec seconds.
 
@@ -371,6 +378,12 @@ def run_signal_extraction(cap, actual_fps,
     else:
         print(f"Motion rejection: OFF  (no profile)")
     print("Press Q to stop early")
+
+    if on_progress is not None:
+        try:
+            on_progress(0)
+        except Exception:
+            pass
 
     consecutive_failures = 0
 
@@ -424,12 +437,13 @@ def run_signal_extraction(cap, actual_fps,
                 detector, current_ita,
                 forehead_mask, cheek_mask
             )
-            cv2.imshow(
-                f"Signal Extraction — {modality.upper()}",
-                frame
-            )
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            if show_display:
+                cv2.imshow(
+                    f"Signal Extraction — {modality.upper()}",
+                    frame
+                )
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
             continue
 
         # ── Accept frame ──────────────────────────
@@ -438,6 +452,13 @@ def run_signal_extraction(cap, actual_fps,
             pixel_count, quality_ratio,
             current_ita, thresholds_used
         )
+
+        if on_progress is not None:
+            progress, _ = buffer.get_progress()
+            try:
+                on_progress(int(progress * 100))
+            except Exception:
+                pass
 
         # ── Live frame callback ───────────────────
         # Called on every accepted clean frame.
@@ -523,15 +544,17 @@ def run_signal_extraction(cap, actual_fps,
             (100, 100, 100), 2
         )
 
-        cv2.imshow(
-            f"Signal Extraction — {modality.upper()}",
-            display
-        )
+        if show_display:
+            cv2.imshow(
+                f"Signal Extraction — {modality.upper()}",
+                display
+            )
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-    cv2.destroyAllWindows()
+    if show_display:
+        cv2.destroyAllWindows()
 
     quality_ok, issues, snr, thresh_summary = \
         assess_signal_quality(buffer)

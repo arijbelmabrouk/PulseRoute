@@ -267,9 +267,9 @@ export default function DoctorPage() {
   const [activeTab, setActiveTab]   = useState('live')
 
   // ── Start panel state ─────────────────────────────
-  const [startMode,    setStartMode]   = useState('auto')
-  const [startPid,     setStartPid]    = useState('')
   const [isStarting,   setIsStarting]  = useState(false)
+  // Mode comes from patient's selection — doctor does not override
+  const patientMode = state.patient_mode || 'auto'
 
   // ── History state ──────────────────────────────────
   const [history,      setHistory]     = useState([])
@@ -292,6 +292,7 @@ export default function DoctorPage() {
                   || state.status === 'starting'
   const isComplete = state.status === 'complete'
   const modality   = state.modality || 'face'
+  const patientConnectionCount = Number(state.patient_connection_count || 0)
 
   const hrVal      = isComplete ? final.hr_bpm    : s9.hr_bpm
   const rrVal      = isComplete ? final.rr_bpm    : s10.rr_bpm
@@ -308,13 +309,14 @@ export default function DoctorPage() {
   const handleStart = async () => {
     setIsStarting(true)
     try {
+      const payload = {
+        mode: patientMode,
+        ...(serverPid ? { patient_id: serverPid } : {}),
+      }
       await fetch('http://localhost:8000/api/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mode:       startMode,
-          patient_id: startPid.trim(),
-        }),
+        body: JSON.stringify(payload),
       })
     } catch (e) {
       console.error('Start failed:', e)
@@ -346,8 +348,11 @@ export default function DoctorPage() {
   }, [])
 
   useEffect(() => {
-    if (activeTab === 'history') fetchHistory(historyPid)
-  }, [activeTab])
+    if (activeTab === 'history') {
+      const pid = historyPid || serverPid
+      fetchHistory(pid)
+    }
+  }, [activeTab, serverPid, historyPid])
 
   // ── Render ─────────────────────────────────────────
   return (
@@ -390,13 +395,13 @@ export default function DoctorPage() {
           display: 'flex', alignItems: 'center', gap: 10,
         }}>
           {/* Patient ID (from server or local) */}
-          {(serverPid || startPid) && (
+          {serverPid && (
             <span style={{
               fontSize: 12, color: C.navy, fontWeight: 500,
               padding: '4px 12px', borderRadius: 20,
               background: C.blueLight, border: `1px solid ${C.border}`,
             }}>
-              {serverPid || startPid}
+              {serverPid}
             </span>
           )}
 
@@ -448,39 +453,44 @@ export default function DoctorPage() {
         padding: '0.75rem 2rem',
         display: 'flex', alignItems: 'center', gap: 12,
       }}>
-        {/* Patient ID */}
-        <input
-          value={startPid}
-          onChange={e => setStartPid(e.target.value)}
-          placeholder="Patient name / ID"
-          disabled={isRunning}
-          style={{
-            padding: '7px 14px', borderRadius: 20, fontSize: 13,
-            border: `1px solid ${C.border}`, fontFamily: C.sans,
-            background: isRunning ? C.bg : C.white,
-            color: C.navy, outline: 'none', width: 200,
-          }}
-        />
-
-        {/* Mode toggle */}
         <div style={{
-          display: 'flex', borderRadius: 20,
-          border: `1px solid ${C.border}`, overflow: 'hidden',
-          opacity: isRunning ? 0.5 : 1,
+          padding: '7px 14px', borderRadius: 20, fontSize: 13,
+          border: `1px solid ${C.border}`, fontFamily: C.sans,
+          background: C.bg, color: C.navy, minWidth: 200,
         }}>
-          {['auto', 'palm'].map(m => (
-            <button key={m} onClick={() => !isRunning && setStartMode(m)}
-              style={{
-                padding: '7px 18px', fontSize: 12, fontWeight: 600,
-                letterSpacing: '0.04em', textTransform: 'uppercase',
-                border: 'none', cursor: isRunning ? 'default' : 'pointer',
-                background: startMode === m ? C.blue : C.white,
-                color: startMode === m ? C.white : C.muted,
-                transition: 'all 0.2s',
-              }}>
-              {m}
-            </button>
-          ))}
+          {serverPid || 'Waiting for patient to enter ID'}
+        </div>
+
+        {/* Patient mode — set by patient, read-only for doctor */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          fontSize: 12, fontWeight: 600, padding: '7px 16px',
+          borderRadius: 20, border: `1px solid ${C.border}`,
+          background: C.bg, color: C.navy,
+        }}>
+          <span style={{ color: C.muted, fontWeight: 400 }}>Mode:</span>
+          <span style={{
+            color: patientMode === 'palm' ? C.amber : C.blue,
+            textTransform: 'uppercase', letterSpacing: '0.04em',
+          }}>{patientMode || 'waiting'}</span>
+          {!state.patient_mode && (
+            <span style={{ color: C.muted, fontWeight: 400, fontSize: 11 }}>
+              (patient selects)
+            </span>
+          )}
+        </div>
+
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          fontSize: 12, fontWeight: 600, padding: '7px 16px',
+          borderRadius: 20, border: `1px solid ${C.border}`,
+          background: patientConnectionCount > 0 ? C.greenBg : C.bg,
+          color: patientConnectionCount > 0 ? C.green : C.navy,
+        }}>
+          <span style={{ color: C.muted, fontWeight: 400 }}>Patient ready:</span>
+          <span style={{
+            textTransform: 'uppercase', letterSpacing: '0.04em',
+          }}>{patientConnectionCount > 0 ? `${patientConnectionCount}` : '0'}</span>
         </div>
 
         {/* Start / Reset */}
@@ -527,8 +537,8 @@ export default function DoctorPage() {
         <span style={{
           fontSize: 11, color: C.muted, fontFamily: C.sans,
         }}>
-          Mode: {startMode.toUpperCase()}
-          {startPid ? ` · ${startPid}` : ''}
+          Mode: {patientMode.toUpperCase()}
+          {serverPid ? ` · ${serverPid}` : ''}
         </span>
       </div>
 
@@ -759,7 +769,7 @@ export default function DoctorPage() {
                     marginBottom: '0.75rem',
                   }}>Subject profile</p>
                   <InfoRow label="Patient"
-                    value={serverPid || startPid || null} />
+                    value={serverPid || null} />
                   <InfoRow label="ITA"
                     value={s2.ita != null ? String(s2.ita) : null} />
                   <InfoRow label="Fitzpatrick"

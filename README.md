@@ -7,7 +7,7 @@
 
 A contactless vital signs monitor that measures **heart rate**, **heart rate variability (HRV)**, and **respiratory rate** using only a standard webcam — no wearable, no contact, no hardware beyond a camera.
 
-The system uses **remote photoplethysmography (rPPG)**, a technique that detects the microscopic color changes in skin caused by blood pulsing through capillaries with each heartbeat. These changes are invisible to the naked eye but measurable from video frames.
+The system uses **remote photoplethysmography (rPPG)**, a technique that detects the microscopic colour changes in skin caused by blood pulsing through capillaries with each heartbeat. These changes are invisible to the naked eye but measurable from video frames.
 
 ---
 
@@ -34,11 +34,11 @@ A `SubjectProfile` object is built during Step 2 and passed through every downst
 
 | Threshold | Old approach | New approach |
 |---|---|---|
-| Motion rejection | Fixed delta of 6.0 | 5x patient's own noise floor |
+| Motion rejection | Fixed delta of 6.0 | 5× patient's own noise floor |
 | Amplitude scoring ceiling | Fixed 0.006 | 80% of patient's calibration amplitude, scaled to filtered domain |
 | HRV reliability floor | Fixed 0.002 | 10% of patient's personal amplitude target |
 | Artifact clipping multiplier | Fixed 4.0 std | 3.0–5.0 std scaled to patient's signal variance |
-| Bandpass window | Always 40–180 BPM | +/-30 BPM around patient's estimated HR |
+| Bandpass window | Always 40–180 BPM | ±30 BPM around patient's estimated HR |
 | RR filter tolerance | Fixed 40% | 30–50% based on measured signal quality |
 | Routing thresholds | Fixed 0.60 / 0.40 | ITA-adjusted per skin tone group |
 | HRV interpretation | Population average | Age-adjusted norms when age is available |
@@ -82,11 +82,13 @@ Step 2  -- Face ROI extraction (BiSeNet) + Subject Calibration   [10s total]
   |            - _estimate_hr_from_signal() -> bandpass hint
   |            - ITA -> Fitzpatrick type -> routing threshold adjustment
   |         SubjectProfile passed to ALL downstream steps
+  |         on_frame callback streams annotated frames to patient page live
   v
 Step 3  -- RGB signal extraction + motion rejection
   |         MotionDetector uses profile.get_motion_threshold() (personal)
   |         Rejected frames silently skipped; recording extends automatically
   |         Up to 2.5x target duration if patient is moving
+  |         on_frame callback continues live feed to patient page
   v
 Step 4  -- Normalization
   |         DC removal + linear detrending
@@ -135,6 +137,7 @@ Step 2b -- Palm ROI extraction (MediaPipe) + Palm Calibration   [10s] |
   |         Phase 1 (0-5s): MediaPipe hand landmarks -> palm mask      |
   |         Phase 2 (5-10s): Pixel sampling -> palm SubjectProfile     |
   |         Palm profile is INDEPENDENT from face profile              |
+  |         on_frame callback streams palm setup to patient page live  |
   v
 Step 3b -- Palm RGB signal extraction (35s)
   v
@@ -185,7 +188,7 @@ std_floor        = amplitude_target x 0.10
 amplitude_target = 0.80 x baseline_g_std x calibrate_scale_factor()
 ```
 
-This floor is anchored to this patient's own calibration signal on this device — not a fixed constant. When triggered, individual beat peaks are too close to the noise floor for precise timing, and RMSSD becomes unreliable (inflated 3–5x). Routing to palm is the correct clinical response.
+This floor is anchored to this patient's own calibration signal on this device — not a fixed constant. When triggered, individual beat peaks are too close to the noise floor for precise timing, and RMSSD becomes unreliable (inflated 3–5×). Routing to palm is the correct clinical response.
 
 ---
 
@@ -223,23 +226,30 @@ Doctor reviews patient info and clicks Start
 Server spawns run_web.py as a subprocess with mode and patient ID via env vars
   |
   v
-Pipeline runs and publishes events + annotated camera frames via WebSocket
+Pipeline runs and publishes events + annotated camera frames to WebSocket
   |
   v
-Patient page: live camera feed with ROI overlay + step progress
-Doctor page: live metrics updating per step + SNR trace + subject profile
+Patient page: live camera feed with HUD overlay (identical to OpenCV window)
+              + step-by-step progress checklist
+Doctor page:  live metrics updating per step + SNR trace + subject profile
   |
   v
 Results published to both pages simultaneously
-Doctor page: routing decision, range indicators, history tab
+Doctor page: routing decision, normal range indicators, session history tab
 ```
 
 ### Pages
 
 | Page | URL | Audience | Key features |
 |---|---|---|---|
-| Patient view | `http://localhost:5173/patient` | Patient screen | Name/ID entry, mode selection, live camera feed with ROI overlay, step progress, results |
+| Patient view | `http://localhost:5173/patient` | Patient screen | Name/ID entry, mode selection, live camera feed with HUD, step progress, results |
 | Doctor dashboard | `http://localhost:5173/doctor` | Clinician | Start button, live metrics per step, normal range indicators, SNR chart, routing decision with reason, session history |
+
+### Patient page — live feed
+
+The patient page displays the camera feed starting from the first frame of Step 2 Phase 1 — not just during Step 3. The feed shows exactly what the OpenCV window shows: the forehead mask (green), cheek mask (blue/purple), HUD text (phase label, countdown, ITA, calibration sample count), motion rejection warnings in red, and the recording progress bar during Step 3. All overlays are drawn onto the frame pixels by the pipeline before encoding, so the patient page renders a bare `<img>` tag with no React overlays on top.
+
+The frame publishing architecture uses a background daemon thread with a queue size of 10. A `time.sleep(0)` GIL yield after each enqueue ensures the publisher thread gets scheduled immediately during BiSeNet inference, which would otherwise hold the CPython GIL for hundreds of milliseconds at a time and delay frame delivery.
 
 ### Doctor page features
 
@@ -251,13 +261,6 @@ Doctor page: routing decision, range indicators, history tab
 - Session history tab: reads `logs/sessions.csv` via `GET /api/history`, filterable by patient ID
 - Re-measure button kills the current pipeline and resets state
 - Routing decision card explains why face or palm was used
-
-### Patient page features
-
-- Name/ID entry and mode selection before measurement starts
-- Live annotated camera feed during Step 3 (ROI overlay shows active measurement regions)
-- Step-by-step progress checklist
-- Results card on completion with HR and respiratory rate
 
 ### Launch
 
@@ -303,7 +306,7 @@ profile.build_from_calibration(
 | `fitzpatrick` | FST group string |
 | `baseline_g_mean` | Mean green pixel value at rest |
 | `baseline_g_std` | Green channel noise floor |
-| `motion_threshold` | 5x personal noise floor |
+| `motion_threshold` | 5× personal noise floor |
 | `amplitude_target` | 80% of personal best, scaled to filtered domain |
 | `calib_to_filtered_scale` | Measured per session by `calibrate_scale_factor()` |
 | `hr_estimate_bpm` | Rough HR from calibration (bandpass hint only) |
@@ -317,8 +320,18 @@ profile.build_from_calibration(
 | `get_amplitude_target()` | Step 11 | Personal amplitude scoring ceiling |
 | `get_std_floor()` | Step 11 | Personal HRV reliability floor |
 | `get_clip_multiplier()` | Step 6 | Personal artifact clipping std multiplier (3.0–5.0) |
-| `get_bandpass_hint()` | Step 6 | (low_hz, high_hz) around estimated HR +/- 30 BPM |
+| `get_bandpass_hint()` | Step 6 | (low_hz, high_hz) around estimated HR ±30 BPM |
 | `get_rr_tolerance(quality)` | Step 8 | Dynamic RR filter tolerance (0.30–0.50) |
+
+---
+
+## Session logging
+
+Every measurement session is logged to `logs/sessions.csv` (one row per session). Fields include:
+
+`timestamp`, `mode`, `ita`, `fitzpatrick`, `profile_valid`, `calibration_scale_factor`, `fps_measured`, `face_snr_score`, `face_quality_level`, `face_hr_bpm`, `face_rr_bpm`, `face_rmssd`, `face_hr_reliable`, `face_confidence`, `routing_decision`, `routing_reason`, `palm_hr_bpm`, `palm_rr_bpm`, `palm_snr_score`, `palm_hr_reliable`, `palm_confidence`, `final_modality`, `final_hr_bpm`, `final_rr_bpm`, `hrv_available`, `failure_reason`, `session_duration_sec`
+
+The session history tab in the doctor page reads this file directly via `GET /api/history`.
 
 ---
 
@@ -392,8 +405,8 @@ rPPG_project/
 +-- step2_face_ROI_extraction/           # BiSeNet semantic face parsing
 +-- step2_palm_ROI_extraction/           # MediaPipe hand landmark detection
 +-- step3_signal_extraction/
-|   +-- step3_face_signal_bisenet.py     # Face modality + calibration phase
-|   +-- step3_palm_signal.py             # Palm modality + palm calibration phase
+|   +-- step3_face_signal_bisenet.py     # Face modality + calibration phase + on_frame
+|   +-- step3_palm_signal.py             # Palm modality + palm calibration + on_frame
 |   +-- step3_rgb_signal.py             # Core extraction + MotionDetector + on_frame callback
 +-- step4_normalization/
 +-- step5_pulse_signal_extraction/       # POS algorithm (Wang et al. 2017)
@@ -405,7 +418,7 @@ rPPG_project/
 +-- step11_signal_quality_score/         # SNR scoring + ITA-adjusted routing
 +-- step12_display/                      # Web dashboard
     +-- server.py                        # FastAPI: /api/start /api/history /api/frame
-    +-- publisher.py                     # Pipeline -> server event publishing
+    +-- publisher.py                     # Pipeline -> server event publishing (non-blocking)
     +-- frontend/
         +-- src/
             +-- pages/
@@ -438,13 +451,15 @@ rPPG_project/
 | Palm routing in run.py | Complete |
 | Palm routing in run_web.py | Complete |
 | Step 12 — Web dashboard architecture | Complete |
-| Step 12 — Live camera feed via WebSocket | Complete |
+| Step 12 — Live camera feed from Step 2 Phase 1 onward | Complete |
+| Step 12 — Non-blocking frame publisher (GIL-aware) | Complete |
 | Step 12 — Session history tab | Complete |
 | Step 12 — Doctor Start button (pipeline on demand) | Complete |
-| Step 12 — Patient mode selection (Auto / Palm) | In development |
+| Step 12 — Patient mode selection (Auto / Palm) | Complete |
+| Step 12 — Normal range indicators on doctor page | Complete |
 | Step 12 — Patient-ready handshake | In development |
 | Logging — sessions.csv with patient ID | Complete |
-| OpenCV headless mode for web deployment | In development |
+| OpenCV headless mode for web deployment | Complete |
 
 ---
 

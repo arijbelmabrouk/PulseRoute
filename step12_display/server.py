@@ -40,6 +40,7 @@ shared_state: Dict[str, Any] = {
     "progress":  0,
     "steps":     {},
     "patient_id": "",
+    "patient_connection_count": 0,
 }
 
 patient_connections: Set[WebSocket] = set()
@@ -124,14 +125,25 @@ async def startup():
 # ─────────────────────────────────────────
 
 async def _ws_keepalive(ws: WebSocket,
-                         connections: Set[WebSocket]):
+                         connections: Set[WebSocket],
+                         is_patient: bool = False):
     """Accept, send current state, keep alive."""
     await ws.accept()
     connections.add(ws)
+
+    if is_patient:
+        await broadcast_event({
+            "patient_connection_count": len(patient_connections),
+        })
+
     try:
         await ws.send_text(json.dumps(shared_state))
     except Exception:
         connections.discard(ws)
+        if is_patient:
+            await broadcast_event({
+                "patient_connection_count": len(patient_connections),
+            })
         return
     try:
         while True:
@@ -143,11 +155,15 @@ async def _ws_keepalive(ws: WebSocket,
         pass
     finally:
         connections.discard(ws)
+        if is_patient:
+            await broadcast_event({
+                "patient_connection_count": len(patient_connections),
+            })
 
 
 @app.websocket("/ws/patient")
 async def patient_ws(websocket: WebSocket):
-    await _ws_keepalive(websocket, patient_connections)
+    await _ws_keepalive(websocket, patient_connections, is_patient=True)
 
 
 @app.websocket("/ws/doctor")
@@ -186,8 +202,13 @@ async def set_patient_id(payload: Dict[str, Any]):
     Stored in shared_state and broadcast to the doctor.
     """
     patient_id = str(payload.get("patient_id", "")).strip()
-    shared_state["patient_id"] = patient_id
-    await broadcast_event({"patient_id": patient_id})
+    patient_mode = str(payload.get("mode", "auto")).strip()
+    shared_state["patient_id"]   = patient_id
+    shared_state["patient_mode"] = patient_mode
+    await broadcast_event({
+        "patient_id":   patient_id,
+        "patient_mode": patient_mode,
+    })
     return {"ok": True}
 
 
@@ -214,8 +235,11 @@ async def start_pipeline(payload: Dict[str, Any]):
             pass
         _pipeline_proc = None
 
-    mode       = str(payload.get("mode",       "auto")).strip()
-    patient_id = str(payload.get("patient_id", "")).strip()
+    # Mode: use payload override, else patient's stored choice, else auto
+    mode       = str(payload.get("mode") or
+                     shared_state.get("patient_mode", "auto")).strip()
+    patient_id = str(payload.get("patient_id", "")
+                     or shared_state.get("patient_id", "")).strip()
 
     # Reset state before starting
     fresh: Dict[str, Any] = {
@@ -232,6 +256,7 @@ async def start_pipeline(payload: Dict[str, Any]):
     env = os.environ.copy()
     env["PULSEROUTE_MODE"]       = mode
     env["PULSEROUTE_PATIENT_ID"] = patient_id
+    env["PULSEROUTE_HEADLESS"]   = "true"
 
     script = os.path.join(_PROJECT_ROOT, "run_web.py")
 
@@ -264,15 +289,37 @@ async def get_history(patient_id: str = Query("")):
     if not os.path.exists(_LOG_FILE):
         return []
 
+    expected_fields = [
+        'timestamp', 'patient_id', 'patient_age', 'mode', 'ita',
+        'fitzpatrick', 'profile_valid', 'calibration_scale_factor',
+        'fps_measured', 'face_snr_score', 'face_quality_level',
+        'face_hr_bpm', 'face_rr_bpm', 'face_rmssd', 'face_hr_reliable',
+        'face_confidence', 'routing_decision', 'routing_reason',
+        'palm_hr_bpm', 'palm_rr_bpm', 'palm_snr_score',
+        'palm_hr_reliable', 'palm_confidence', 'final_modality',
+        'final_hr_bpm', 'final_rr_bpm', 'hrv_available',
+        'hrv_fps_message', 'failure_reason', 'session_duration_sec',
+    ]
+
     rows = []
     try:
-        with open(_LOG_FILE, encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                pid = row.get("patient_id", "").strip()
-                if patient_id and pid != patient_id.strip():
-                    continue
-                rows.append(dict(row))
+        with open(_LOG_FILE, newline='', encoding="utf-8") as f:
+            reader = list(csv.reader(f))
+
+        if not reader:
+            return []
+
+        header = reader[0]
+        if all(field in expected_fields for field in header):
+            records = [dict(zip(header, row)) for row in reader[1:]]
+        else:
+            records = [dict(zip(expected_fields, row)) for row in reader]
+
+        for row in records:
+            pid = row.get("patient_id", "").strip()
+            if patient_id and pid != patient_id.strip():
+                continue
+            rows.append(row)
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -286,6 +333,14 @@ async def get_history(patient_id: str = Query("")):
 @app.get("/api/state")
 async def get_state():
     return shared_state
+
+
+@app.get("/api/patient-connections")
+async def get_patient_connections():
+    return {
+        "count": len(patient_connections),
+        "ready": len(patient_connections) > 0,
+    }
 
 
 @app.post("/api/reset")

@@ -60,7 +60,9 @@ class FaceROIState:
 # ─────────────────────────────────────────
 
 def run_face_roi_extraction(cap, actual_fps,
-                             state, duration_sec=10):
+                             state, duration_sec=10,
+                             show_display=True,
+                             on_frame=None):
     """
     Run BiSeNet face ROI extraction + calibration.
 
@@ -70,21 +72,23 @@ def run_face_roi_extraction(cap, actual_fps,
         Phase 2 (second half): Pixel values sampled
             through locked mask → SubjectProfile built.
 
-    NEW — Calibration quality gate + retry loop:
-        After build_from_calibration, profile.validate()
-        checks whether the calibration data is
-        trustworthy. If not, the patient is shown
-        a specific error message and asked to fix the
-        problem (reposition, improve lighting, etc).
-        The calibration phase retries up to
-        MAX_CALIB_ATTEMPTS times before giving up
-        and using population defaults.
+    NEW — on_frame callback:
+        Optional callback(frame_bgr, combined_mask)
+        called every frame with the annotated setup frame.
+        Used by run_web.py to stream Step 2 live to the
+        patient page — same visuals as the OpenCV window.
+
+        The callback receives the frame AFTER _draw_setup_hud
+        has drawn all overlays onto it, so what the patient
+        sees is identical to what the OpenCV window shows.
 
     Input:
         cap          — VideoCapture from Step 1
         actual_fps   — fps from Step 1
         state        — FaceROIState shared object
         duration_sec — total setup duration (default 10s)
+        show_display — whether to call cv2.imshow
+        on_frame     — optional callback(frame_bgr, mask)
 
     Returns:
         profile — SubjectProfile (valid or fallback)
@@ -165,16 +169,29 @@ def run_face_roi_extraction(cap, actual_fps,
                         )
                         state.ita = ita
 
+                remaining = phase1_end - time.time()
                 _draw_setup_hud(
                     frame, state,
-                    phase1_end - time.time(),
+                    remaining,
                     "Phase 1: Establishing mask",
                     (0, 255, 255)
                 )
-                cv2.imshow(
-                    "Step 2 — Face ROI (BiSeNet)", frame
-                )
-                cv2.waitKey(1)
+
+                # ── Live feed callback ─────────────
+                # Send the annotated frame to the patient
+                # page via run_web.py's make_frame_callback.
+                # The frame already has the HUD drawn on it.
+                if on_frame is not None:
+                    try:
+                        on_frame(frame, state.combined_mask)
+                    except Exception:
+                        pass
+
+                if show_display:
+                    cv2.imshow(
+                        "Step 2 — Face ROI (BiSeNet)", frame
+                    )
+                    cv2.waitKey(1)
 
             mask_established = True
 
@@ -219,17 +236,36 @@ def run_face_roi_extraction(cap, actual_fps,
                 calib_r.append(mean_r)
                 calib_b.append(mean_b)
 
+            remaining = phase2_end - time.time()
+
+            # Build label that matches terminal exactly
+            if attempt > 1:
+                label = (f"Phase 2: Calibrating — "
+                         f"Retry {attempt}/{MAX_CALIB_ATTEMPTS} "
+                         f"({len(calib_g)} frames)")
+            else:
+                label = (f"Phase 2: Calibrating "
+                         f"({len(calib_g)} frames)")
+
             _draw_setup_hud(
                 frame, state,
-                phase2_end - time.time(),
-                f"Phase 2: Calibrating "
-                f"({len(calib_g)} frames)",
+                remaining,
+                label,
                 (0, 200, 255)
             )
-            cv2.imshow(
-                "Step 2 — Face ROI (BiSeNet)", frame
-            )
-            cv2.waitKey(1)
+
+            # ── Live feed callback ─────────────────
+            if on_frame is not None:
+                try:
+                    on_frame(frame, state.combined_mask)
+                except Exception:
+                    pass
+
+            if show_display:
+                cv2.imshow(
+                    "Step 2 — Face ROI (BiSeNet)", frame
+                )
+                cv2.waitKey(1)
 
         # ── Build profile ──────────────────────────
         profile = SubjectProfile()
@@ -256,7 +292,9 @@ def run_face_roi_extraction(cap, actual_fps,
 
         if attempt < MAX_CALIB_ATTEMPTS:
             _show_retry_screen(
-                cap, reason, attempt, MAX_CALIB_ATTEMPTS
+                cap, reason, attempt, MAX_CALIB_ATTEMPTS,
+                show_display=show_display,
+                on_frame=on_frame
             )
         else:
             print(f"\n  ⚠ All {MAX_CALIB_ATTEMPTS} calibration "
@@ -269,7 +307,8 @@ def run_face_roi_extraction(cap, actual_fps,
                 state.ita
             )
 
-    cv2.destroyAllWindows()
+    if show_display:
+        cv2.destroyAllWindows()
 
     profile.print_profile()
 
@@ -287,7 +326,9 @@ def run_face_roi_extraction(cap, actual_fps,
 
 
 def _show_retry_screen(cap, reason,
-                        attempt, max_attempts):
+                        attempt, max_attempts,
+                        show_display=True,
+                        on_frame=None):
     deadline = time.time() + 4.0
 
     if "moved" in reason.lower() or \
@@ -369,8 +410,18 @@ def _show_retry_screen(cap, reason,
             0.6, (200, 200, 200), 1
         )
 
-        cv2.imshow("Step 2 — Face ROI (BiSeNet)", frame)
-        cv2.waitKey(1)
+        # ── Live feed callback — retry overlay ────
+        # Patient page shows the darkened retry screen
+        # with the instruction text, identical to OpenCV.
+        if on_frame is not None:
+            try:
+                on_frame(frame, None)
+            except Exception:
+                pass
+
+        if show_display:
+            cv2.imshow("Step 2 — Face ROI (BiSeNet)", frame)
+            cv2.waitKey(1)
 
 
 def _draw_setup_hud(frame, state,
@@ -419,7 +470,9 @@ def run_face_signal_extraction(cap, actual_fps,
                                 state,
                                 duration_sec=30,
                                 profile=None,
-                                on_frame=None):   # ← NEW
+                                on_frame=None,
+                                on_progress=None,
+                                show_display=True):
     """
     Run Step 3 RGB signal extraction using face mask.
 
@@ -432,6 +485,8 @@ def run_face_signal_extraction(cap, actual_fps,
         on_frame     — optional callback(frame_bgr, mask)
                        called on every accepted frame
                        for live camera feed publishing
+        on_progress  — optional callback(percent: int)
+        show_display — whether to call cv2.imshow
 
     Output:
         r, g, b        — raw signal arrays (N,)
@@ -457,5 +512,7 @@ def run_face_signal_extraction(cap, actual_fps,
         modality     = "face",
         duration_sec = duration_sec,
         profile      = profile,
-        on_frame     = on_frame        # ← NEW
+        on_frame     = on_frame,
+        on_progress  = on_progress,
+        show_display = show_display
     )

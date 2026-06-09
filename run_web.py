@@ -1,5 +1,6 @@
 import base64
 import os
+import signal
 import sys
 import numpy as np
 
@@ -7,6 +8,18 @@ import numpy as np
 # Path setup
 # ─────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+PIPELINE_MODE = os.environ.get("PULSEROUTE_MODE", "auto").strip()
+PATIENT_ID    = os.environ.get("PULSEROUTE_PATIENT_ID", "").strip()
+PATIENT_AGE   = os.environ.get("PULSEROUTE_PATIENT_AGE", "").strip()
+HEADLESS      = os.environ.get("PULSEROUTE_HEADLESS", "true").strip().lower() in (
+    "1", "true", "yes"
+)
+SHOW_DISPLAY  = not HEADLESS
+
+_SESSION_WRITTEN = False
+_CAP = None
+_LOGGER = None
 
 FACE_DIR = os.path.join(
     PROJECT_ROOT,
@@ -20,14 +33,6 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, FACE_DIR)
 sys.path.insert(0, REPO_DIR)
 sys.path.insert(0, STEP3_DIR)
-
-# ─────────────────────────────────────────
-# Mode + Patient ID from environment
-# Set by server.py when spawning this process.
-# ─────────────────────────────────────────
-
-PIPELINE_MODE = os.environ.get("PULSEROUTE_MODE", "auto").strip()
-PATIENT_ID    = os.environ.get("PULSEROUTE_PATIENT_ID", "").strip()
 
 # ─────────────────────────────────────────
 # Imports — one per step
@@ -95,6 +100,7 @@ from step12_display.publisher import (
     publish_final,
     publish,
     publish_frame,
+    publish_recording_progress,
 )
 
 
@@ -106,7 +112,8 @@ from step12_display.publisher import (
 # annotated JPEG so the patient page shows
 # a live camera feed with ROI overlay.
 
-_FRAME_EVERY = 3    # publish every 3rd frame ≈ 10 fps
+_FRAME_EVERY = 2    # publish every 2 accepted clean frames for smoother live UX
+_MAX_FRAME_WIDTH = 480
 
 
 def make_frame_callback(mask_color=(0, 220, 0)):
@@ -119,7 +126,7 @@ def make_frame_callback(mask_color=(0, 220, 0)):
       3. Base64-encodes
       4. Calls publish_frame()
 
-    The _FRAME_EVERY counter throttles to ≈10 fps.
+    The _FRAME_EVERY counter throttles the live feed to reduce backend load.
     """
     _counter = [0]
 
@@ -129,10 +136,29 @@ def make_frame_callback(mask_color=(0, 220, 0)):
             return
         try:
             annotated = frame_bgr.copy()
-            if combined_mask is not None and \
-               np.sum(combined_mask) > 0:
+            mask_for_display = combined_mask
+
+            if annotated.shape[1] > _MAX_FRAME_WIDTH:
+                scale = _MAX_FRAME_WIDTH / float(annotated.shape[1])
+                new_dim = (
+                    _MAX_FRAME_WIDTH,
+                    int(annotated.shape[0] * scale)
+                )
+                annotated = cv2.resize(
+                    annotated, new_dim,
+                    interpolation=cv2.INTER_AREA
+                )
+                if combined_mask is not None:
+                    mask_for_display = cv2.resize(
+                        combined_mask.astype('uint8'),
+                        new_dim,
+                        interpolation=cv2.INTER_NEAREST
+                    )
+
+            if mask_for_display is not None and \
+               np.sum(mask_for_display) > 0:
                 overlay              = np.zeros_like(annotated)
-                overlay[combined_mask == 1] = mask_color
+                overlay[mask_for_display == 1] = mask_color
                 cv2.addWeighted(
                     overlay, 0.35,
                     annotated, 0.65,
@@ -140,7 +166,7 @@ def make_frame_callback(mask_color=(0, 220, 0)):
                 )
             _, buf = cv2.imencode(
                 '.jpg', annotated,
-                [cv2.IMWRITE_JPEG_QUALITY, 55]
+                [cv2.IMWRITE_JPEG_QUALITY, 50]
             )
             b64 = base64.b64encode(buf).decode('utf-8')
             publish_frame(b64)
@@ -148,6 +174,36 @@ def make_frame_callback(mask_color=(0, 220, 0)):
             pass  # never crash pipeline for a frame
 
     return on_frame
+
+
+def make_recording_progress_callback(modality):
+    def on_progress(percent):
+        try:
+            publish_recording_progress(
+                progress=int(percent),
+                message=f"Recording {modality} signal",
+                active=True,
+            )
+        except Exception:
+            pass
+    return on_progress
+
+
+def _cleanup_and_exit(signum, frame):
+    global _SESSION_WRITTEN
+    print(f"\nReceived signal {signum}. Cleaning up...")
+    if _CAP is not None:
+        try:
+            _CAP.release()
+        except Exception:
+            pass
+    if _LOGGER is not None and not _SESSION_WRITTEN:
+        try:
+            _LOGGER.write()
+            _SESSION_WRITTEN = True
+        except Exception:
+            pass
+    sys.exit(0)
 
 
 # ─────────────────────────────────────────
@@ -174,10 +230,21 @@ def measurement_failed(cap, reason, suggestions=None,
         "message":  reason,
     })
 
+    try:
+        publish_recording_progress(
+            progress=100,
+            message="",
+            active=False,
+        )
+    except Exception:
+        pass
+
+    global _SESSION_WRITTEN
     if logger is not None:
         try:
             logger.set_failure(reason)
             logger.write()
+            _SESSION_WRITTEN = True
         except Exception:
             pass
 
@@ -437,7 +504,8 @@ def print_hr_line(hr_results):
 
 def run_palm_pipeline(cap, actual_fps,
                        face_state=None, face_profile=None,
-                       palm_mode=False, logger=None):
+                       palm_mode=False, logger=None,
+                       show_display=True):
     """Run full palm pipeline: Step 2b → 3b → 4–11."""
     from step3_signal_extraction.step3_palm_signal import (
         PalmROIState,
@@ -462,7 +530,9 @@ def run_palm_pipeline(cap, actual_fps,
     print(f"\n{'='*50}\nSTEP 2b — Palm ROI + Calibration\n{'='*50}")
     palm_state   = PalmROIState()
     palm_profile = run_palm_roi_extraction(
-        cap, actual_fps, palm_state, duration_sec=10
+        cap, actual_fps, palm_state,
+        duration_sec=10,
+        show_display=show_display
     )
 
     if palm_state.combined_mask is None:
@@ -496,16 +566,34 @@ def run_palm_pipeline(cap, actual_fps,
     # ── Step 3b ───────────────────────────────────
     print(f"\n{'='*50}\nSTEP 3b — Palm RGB signal\n{'='*50}")
 
+    publish_recording_progress(
+        progress=0,
+        message="Recording palm signal",
+        active=True,
+    )
+
     palm_frame_cb = make_frame_callback(
         mask_color=(0, 200, 255)   # cyan for palm
     )
+    palm_progress_cb = make_recording_progress_callback('palm')
 
     r, g, b, fps_measured, quality_ok, issues, _ = \
         run_palm_signal_extraction(
             cap, actual_fps, palm_state,
             duration_sec=35, profile=palm_profile,
-            on_frame=palm_frame_cb
+            on_frame=palm_frame_cb,
+            on_progress=palm_progress_cb,
+            show_display=show_display
         )
+
+    try:
+        publish_recording_progress(
+            progress=100,
+            message="",
+            active=False,
+        )
+    except Exception:
+        pass
 
     if logger is not None:
         logger.set_fps(fps_measured)
@@ -554,6 +642,8 @@ if __name__ == "__main__":
     print("="*50)
     print(f"Mode:       {PIPELINE_MODE}")
     print(f"Patient ID: {PATIENT_ID or '(not set)'}")
+    print(f"Patient age: {PATIENT_AGE or '(unknown)'}")
+    print(f"Headless:   {SHOW_DISPLAY is False}")
 
     publish_status("starting", 0, "Initialising pipeline")
 
@@ -574,7 +664,14 @@ if __name__ == "__main__":
     logger = SessionLogger()
     logger.set_patient_id(PATIENT_ID)
     logger.set_mode(PIPELINE_MODE)
+    logger.set_patient_age(PATIENT_AGE)
     logger.set_fps(actual_fps)
+
+    _CAP = cap
+    _LOGGER = logger
+
+    signal.signal(signal.SIGINT, _cleanup_and_exit)
+    signal.signal(signal.SIGTERM, _cleanup_and_exit)
 
     palm_mode = (PIPELINE_MODE == "palm")
 
@@ -588,7 +685,8 @@ if __name__ == "__main__":
          palm_state, palm_profile) = run_palm_pipeline(
             cap, actual_fps,
             face_state=None, face_profile=None,
-            palm_mode=True, logger=logger
+            palm_mode=True, logger=logger,
+            show_display=SHOW_DISPLAY
         )
         logger.set_routing(None, 'direct_palm_mode')
 
@@ -634,7 +732,9 @@ if __name__ == "__main__":
         print(f"\n{'='*50}\nSTEP 2 — Face ROI + Calibration\n{'='*50}")
         face_state = FaceROIState()
         profile    = run_face_roi_extraction(
-            cap, actual_fps, face_state, duration_sec=10
+            cap, actual_fps, face_state,
+            duration_sec=10,
+            show_display=SHOW_DISPLAY
         )
 
         if face_state.combined_mask is None:
@@ -663,16 +763,34 @@ if __name__ == "__main__":
         # ── Step 3 — Face RGB signal ───────────────
         print(f"\n{'='*50}\nSTEP 3 — RGB signal (face)\n{'='*50}")
 
+        publish_recording_progress(
+            progress=0,
+            message="Recording face signal",
+            active=True,
+        )
+
         face_frame_cb = make_frame_callback(
             mask_color=(0, 220, 0)   # green for face
         )
+        face_progress_cb = make_recording_progress_callback('face')
 
         r, g, b, fps_measured, quality_ok, issues, _ = \
             run_face_signal_extraction(
                 cap, actual_fps, face_state,
                 duration_sec=35, profile=profile,
-                on_frame=face_frame_cb
+                on_frame=face_frame_cb,
+                on_progress=face_progress_cb,
+                show_display=SHOW_DISPLAY
             )
+
+        try:
+            publish_recording_progress(
+                progress=100,
+                message="",
+                active=False,
+            )
+        except Exception:
+            pass
 
         logger.set_fps(fps_measured)
 
@@ -742,7 +860,8 @@ if __name__ == "__main__":
              palm_state, palm_profile) = run_palm_pipeline(
                 cap, actual_fps,
                 face_state=face_state, face_profile=profile,
-                palm_mode=False, logger=logger
+                palm_mode=False, logger=logger,
+                show_display=SHOW_DISPLAY
             )
 
             if route_palm_again:
