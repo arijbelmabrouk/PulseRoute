@@ -78,7 +78,7 @@ PulseRoute implements an 11-step modular pipeline. Steps 1–11 operate on the f
 
 **Step 5 — POS Pulse Extraction:** The POS algorithm [11] combines the three normalized channels into a single pulse waveform using an adaptive weight α = σ(S1)/σ(S2), where S1 = R−G and S2 = R+G−2B.
 
-**Step 6 — Bandpass Filtering:** A zero-phase Butterworth filter of order 4 is applied. The lower cutoff is set adaptively: if respiratory rate is detected with confidence > 0.4, the cutoff is placed 0.1 Hz above the breathing frequency; otherwise it defaults to 0.917 Hz (55 BPM). A pre-filter clipping step removes samples beyond ±profile.get_clip_multiplier() standard deviations to prevent filter ringing from artifact spikes. The clipping multiplier is personal (range 3.0–5.0) derived from the patient's own calibration variance.
+**Step 6 — Bandpass Filtering:** A zero-phase Butterworth filter of order 4 is applied. The filter uses heart rate bandpass cutoffs in the physiological range 40–180 BPM, but if a respiratory rate is detected with confidence > 0.4, an adaptive notch is applied to remove the breathing frequency before bandpass filtering. A pre-filter clipping step removes pulse samples beyond ±profile.get_clip_multiplier() standard deviations to prevent filter ringing from artifact spikes. The clipping multiplier is personal (range 3.0–5.0) and derived from the patient's own calibration variance.
 
 **Step 7 — FFT Frequency Analysis:** The real FFT of the filtered signal produces a power spectrum from which the dominant HR frequency is identified.
 
@@ -86,9 +86,9 @@ PulseRoute implements an 11-step modular pipeline. Steps 1–11 operate on the f
 
 **Step 9 — HR and HRV Calculation:** Final HR is a weighted combination (0.7 FFT, 0.3 time-domain) when estimates agree within 10 BPM, otherwise FFT-only. RMSSD and SDNN are computed from filtered RR intervals. HRV interpretation uses age-adjusted norms when patient age is available.
 
-**Step 10 — Respiratory Rate:** The normalized green channel is bandpass filtered to 0.1–0.5 Hz (6–30 BrPM) and the dominant frequency extracted via FFT. This step runs before Step 5 to capture the breathing frequency before POS processing modifies low-frequency content.
+**Step 10 — Respiratory Rate:** The normalized green channel is bandpass filtered to 0.1–0.5 Hz (6–30 BrPM) and the dominant frequency extracted via FFT. This step runs before Step 5 because respiratory artifact is best identified in the raw normalized green signal and because the detected breathing frequency is used to design an adaptive notch filter prior to Step 6.
 
-**Step 11 — Signal Quality Score and Routing Decision:** A composite score combining five metrics drives the routing decision through two independent checks (Section 3.3). When palm routing is triggered, Steps 2b–11 repeat on the palm signal with a fresh, independently calibrated SubjectProfile anchored to palm signal characteristics.
+**Step 11 — Signal Quality Score and Routing Decision:** A composite score combining five metrics drives the routing decision through two independent checks (Section 3.3). When palm routing is triggered, Steps 2b–11 repeat on the palm signal with a fresh, independently calibrated SubjectProfile anchored to palm signal characteristics. The palm ROI is extracted from MediaPipe Hands landmarks and calibrated independently from the face profile.
 
 ### 3.2 SubjectProfile: Per-Session Dynamic Calibration
 
@@ -102,16 +102,16 @@ During the 5-second calibration phase, per-frame green channel means are collect
 calib_to_filtered_scale = std(bandpass(g_calib)) / std(g_calib)
 ```
 
-This ratio is device-specific, lighting-specific, and patient-specific. A fixed constant (such as the commonly used 0.004) is derived from one device under one lighting condition and transfers poorly to other deployment contexts. By measuring it per session, all downstream thresholds that depend on this scaling are automatically correct for the current environment.
+In PulseRoute, this mini-filter uses a fourth-order Butterworth passband spanning the physiological HR range (0.667–3.0 Hz). This ratio is device-specific, lighting-specific, and patient-specific. A fixed constant (such as the commonly used 0.004) is derived from one device under one lighting condition and transfers poorly to other deployment contexts. By measuring it per session, all downstream thresholds that depend on this scaling are automatically tuned to the current environment.
 
 **Motion threshold:** 5 × baseline_g_std (minimum 2.0). A frame whose green channel deviates from the rolling mean by more than this value is classified as a motion artifact. Using the patient's own noise floor means a naturally active patient has a proportionally higher threshold rather than being penalized by a threshold calibrated for still laboratory subjects.
 
-**Amplitude target:** 0.80 × baseline_g_std × calib_to_filtered_scale. This is the patient's personal expected best filtered signal amplitude, used as the ceiling for Step 11's amplitude score. Dark-skinned patients under home lighting are scored against their own realistic best rather than a lab benchmark they cannot reach.
+**Amplitude target:** 0.80 × baseline_g_std × calib_to_filtered_scale (with a conservative minimum floor of 0.0002). This is the patient's personal expected best filtered signal amplitude, used as the ceiling for Step 11's amplitude score. Dark-skinned patients under home lighting are scored against their own realistic best rather than a lab benchmark they cannot reach.
 
 **Personal HRV reliability floor** (`get_std_floor`)**:** 
 
 ```
-std_floor = amplitude_target × 0.10
+std_floor = max(amplitude_target × 0.10, 0.0002)
 ```
 
 This is the minimum filtered signal std below which beat timing is too imprecise for reliable RMSSD. Crucially, this floor is personal — it is derived from the patient's own amplitude target rather than a fixed constant. A patient with a naturally strong signal (amplitude_target = 0.030) has a floor of 0.003; a patient with a weak signal (amplitude_target = 0.005) has a floor of 0.0005. The routing system is therefore equally demanding of all patients relative to their own calibration baseline, not relative to a threshold calibrated on a different population.
@@ -162,6 +162,8 @@ Routing thresholds are adjusted downward for darker skin tones because melanin a
 
 Score ≥ HIGH → face accepted. Score ≥ MEDIUM → face accepted with lower confidence. Score < MEDIUM → route to palm.
 
+The score is computed from the filtered pulse spectrum, the RR interval series, and the HR confidence returned by the Step 9 HRV calculation. A penalty is applied when the FFT and time-domain estimates disagree, pushing borderline cases toward palm routing.
+
 **Check 2 — Filtered std below personal HRV reliability floor:**
 
 Even when the composite score passes, the system checks:
@@ -178,6 +180,10 @@ The personal floor adapts to the patient: a patient whose calibration predicted 
 When palm routing is triggered, the reason is logged — composite score failure vs. amplitude floor trigger — so the clinical interface can distinguish between general signal quality problems and the specific physics limitation of face measurement.
 
 **Palm pipeline:** When routing fires, Steps 2b–11 repeat with MediaPipe Hands-based palm ROI detection and a fresh SubjectProfile calibrated from palm pixel values. The palm profile is fully independent of the face profile — palm baseline_g_std is typically higher (less melanin variation), so motion threshold, amplitude target, and HRV floor are all re-anchored to palm signal characteristics rather than carried over from face calibration.
+
+### 3.4 Implementation
+
+PulseRoute is implemented in Python and composed of modular processing steps that mirror the 11-step architecture. It uses BiSeNet for facial semantic segmentation, MediaPipe Hands for palm landmark extraction, SciPy for filtering and FFT processing, and a lightweight web dashboard for teleconsultation-friendly live feedback. All thresholds are obtained from the `SubjectProfile` object, and the code is designed to keep the deployment logic in the domain of the patient session rather than in static population constants.
 
 ---
 
